@@ -1,0 +1,307 @@
+"""Session and Page abstractions — shared interface for both engines.
+
+A :class:`Session` wraps a CDP target and provides high-level methods
+(navigate, evaluate, screenshot, click, fill, get_dom). Both the Lightpanda
+fast path and the CDP-Chrome thorough path produce the same :class:`Session`
+interface so callers can swap engines seamlessly.
+
+A :class:`Page` is the immutable result of a browse/navigate operation.
+"""
+
+from __future__ import annotations
+
+import base64
+import logging
+import os
+import tempfile
+from dataclasses import dataclass, field
+from typing import Any
+
+from ricibrowser.cdp_client import CDPClient, CDPError
+from ricibrowser.utils import detect_cloudflare, extract_links, strip_html, truncate, validate_url
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class Page:
+    """Result of a browse/navigate operation.
+
+    Immutable snapshot of the page state after navigation.
+    """
+
+    url: str
+    """The URL requested."""
+    final_url: str
+    """The URL after redirects (may differ from url)."""
+    status_code: int
+    """HTTP status code (0 if unknown)."""
+    title: str
+    """Page <title>."""
+    text: str
+    """Rendered body text (post-JS, HTML-stripped)."""
+    html: str
+    """Full rendered DOM HTML (post-JS)."""
+    links: list[dict[str, str]] = field(default_factory=list)
+    """Extracted links [{text, href}, ...]."""
+    cookies: list[dict] = field(default_factory=list)
+    """Cookies from the browser context."""
+    truncated: bool = False
+    """Whether text/html was truncated."""
+    cloudflare_challenge: bool = False
+    """Whether a Cloudflare/anti-bot challenge was detected."""
+    cloudflare_type: str | None = None
+    """Challenge type ('cloudflare', 'generic_captcha', or None)."""
+    screenshot_path: str | None = None
+    """Path to screenshot PNG (None if not taken)."""
+    engine: str = "unknown"
+    """Which engine produced this page ('lightpanda' or 'cdp_chrome')."""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to a dict matching the existing tool_browse return format."""
+        return {
+            "status": "ok",
+            "tool": "browse",
+            "url": self.final_url,
+            "http_status": self.status_code,
+            "title": self.title,
+            "text": self.text,
+            "html": self.html,
+            "links": self.links,
+            "link_count": len(self.links),
+            "truncated": self.truncated,
+            "cookies": self.cookies,
+            "stealth": True,
+            "anti_bot_detected": self.cloudflare_challenge,
+            "anti_bot_type": self.cloudflare_type,
+            "screenshot_path": self.screenshot_path,
+            "engine": self.engine,
+        }
+
+
+class Session:
+    """High-level browser session wrapping a CDP target.
+
+    Provides navigate/evaluate/screenshot/click/fill methods. Maintains
+    isolated-world JS execution (never calls Runtime.enable on the main world).
+    """
+
+    def __init__(self, cdp: CDPClient, engine_name: str = "cdp_chrome"):
+        self._cdp = cdp
+        self._engine_name = engine_name
+        self._frame_id: str = ""
+        self._isolated_context_id: int | None = None
+        self._page_enabled = False
+        self._current_url: str = ""
+
+    async def _ensure_page_enabled(self) -> None:
+        """Enable the Page domain (needed for navigation events)."""
+        if not self._page_enabled:
+            try:
+                await self._cdp.send("Page.enable")
+                self._page_enabled = True
+            except CDPError:
+                pass
+
+    async def _get_or_create_isolated_world(self) -> int | None:
+        """Get or create an isolated execution context for JS evaluation.
+
+        Per the CDP spec: Page.createIsolatedWorld creates a new isolated
+        world for the given frame. We NEVER call Runtime.enable on the main
+        context — all JS evaluation goes through isolated worlds.
+        """
+        if self._isolated_context_id is not None:
+            return self._isolated_context_id
+        if not self._frame_id:
+            return None
+        try:
+            result = await self._cdp.send("Page.createIsolatedWorld", {
+                "frameId": self._frame_id,
+                "worldName": "ricibrowser_isolated",
+            })
+            self._isolated_context_id = result.get("executionContextId")
+            return self._isolated_context_id
+        except CDPError as exc:
+            logger.warning("Could not create isolated world: %s", exc)
+            return None
+
+    async def navigate(self, url: str, wait_until: str = "load") -> Page:
+        """Navigate to a URL and wait for the page to settle.
+
+        Args:
+            url: The URL to navigate to.
+            wait_until: When to consider navigation complete.
+                "load" — wait for the load event.
+                "domcontentloaded" — wait for DOMContentLoaded.
+                "networkidle" — wait for network to be idle (requires Network.enabled).
+
+        Returns:
+            A Page with the current state.
+        """
+        url = validate_url(url)
+        await self._ensure_page_enabled()
+
+        # Enable Network domain only if we want network-idle waiting
+        # or debug capture. Otherwise leave it off (detection vector).
+        if wait_until == "networkidle":
+            try:
+                await self._cdp.send("Network.enable")
+            except CDPError:
+                pass
+
+        result = await self._cdp.send("Page.navigate", {"url": url})
+        self._frame_id = result.get("frameId", "")
+        self._current_url = url
+
+        # Reset the isolated world (frame changed)
+        self._isolated_context_id = None
+
+        # Wait for content
+        from ricibrowser.wait import wait_for_content_stable
+        await wait_for_content_stable(self._cdp, self._frame_id, mode=wait_until)
+
+        return await self._capture_page(url)
+
+    async def _capture_page(self, url: str) -> Page:
+        """Capture the current page state into a Page object."""
+        title = await self.evaluate("document.title") or ""
+        html = await self.evaluate("document.documentElement.outerHTML") or ""
+        text = await self.evaluate("document.body ? document.body.innerText : ''") or ""
+
+        if not text and html:
+            text = strip_html(html)
+
+        links = extract_links(html, url)
+
+        # Get HTTP status (not always available via CDP)
+        status_code = 0
+
+        # Get cookies
+        cookies = await self.get_cookies()
+
+        # Detect Cloudflare
+        is_cf, cf_type = detect_cloudflare(html, title)
+
+        # Truncate
+        truncated_text, was_truncated = truncate(text)
+
+        return Page(
+            url=url,
+            final_url=self._current_url,
+            status_code=status_code,
+            title=title,
+            text=truncated_text,
+            html=html,
+            links=links,
+            cookies=cookies,
+            truncated=was_truncated,
+            cloudflare_challenge=is_cf,
+            cloudflare_type=cf_type,
+            engine=self._engine_name,
+        )
+
+    async def evaluate(self, expression: str) -> str | None:
+        """Evaluate JavaScript in an isolated world and return the result.
+
+        NEVER calls Runtime.enable on the main world — uses Page.createIsolatedWorld
+        to create a separate execution context.
+        """
+        context_id = await self._get_or_create_isolated_world()
+        params: dict[str, Any] = {
+            "expression": expression,
+            "returnByValue": True,
+        }
+        if context_id is not None:
+            params["contextId"] = context_id
+
+        try:
+            result = await self._cdp.send("Runtime.evaluate", params)
+            value = result.get("result", {}).get("value")
+            return str(value) if value is not None else None
+        except CDPError as exc:
+            logger.warning("JS evaluation failed: %s", exc)
+            return None
+
+    async def screenshot(self, path: str | None = None, full_page: bool = False) -> str:
+        """Take a screenshot and save to a PNG file.
+
+        Note: screenshots require a rendering engine. Lightpanda does NOT
+        support this — the caller should use CDPChromeEngine for screenshots.
+
+        Returns the path to the saved PNG.
+        """
+        if path is None:
+            fd, path = tempfile.mkstemp(suffix=".png", prefix="ricibrowser_")
+            os.close(fd)
+
+        params: dict[str, Any] = {"format": "png"}
+        if full_page:
+            params["captureBeyondViewport"] = True
+
+        try:
+            result = await self._cdp.send("Page.captureScreenshot", params)
+            data_b64 = result.get("data", "")
+            if data_b64:
+                with open(path, "wb") as f:
+                    f.write(base64.b64decode(data_b64))
+                return path
+        except CDPError as exc:
+            logger.warning("Screenshot failed: %s", exc)
+
+        return path
+
+    async def click(self, selector: str, timeout: float = 5.0) -> bool:
+        """Click an element matching a CSS selector.
+        Returns True if the click succeeded."""
+        js = f"""
+        (function() {{
+            const el = document.querySelector({selector!r});
+            if (!el) return false;
+            el.click();
+            return true;
+        }})()
+        """
+        result = await self.evaluate(js)
+        return result == "true"
+
+    async def fill(self, selector: str, value: str, timeout: float = 5.0) -> bool:
+        """Fill an input element with a value.
+        Returns True if the fill succeeded."""
+        # Escape the value for JS string injection
+        escaped = value.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n")
+        js = f"""
+        (function() {{
+            const el = document.querySelector({selector!r});
+            if (!el) return false;
+            el.value = '{escaped}';
+            el.dispatchEvent(new Event('input', {{bubbles: true}}));
+            el.dispatchEvent(new Event('change', {{bubbles: true}}));
+            return true;
+        }})()
+        """
+        result = await self.evaluate(js)
+        return result == "true"
+
+    async def get_dom(self) -> str:
+        """Return the full rendered DOM HTML."""
+        return await self.evaluate("document.documentElement.outerHTML") or ""
+
+    async def get_cookies(self) -> list[dict]:
+        """Get all cookies from the browser context."""
+        try:
+            result = await self._cdp.send("Network.getCookies")
+            return result.get("cookies", [])
+        except CDPError:
+            return []
+
+    async def set_cookies(self, cookies: list[dict]) -> None:
+        """Set cookies in the browser context."""
+        try:
+            await self._cdp.send("Network.setCookies", {"cookies": cookies})
+        except CDPError as exc:
+            logger.warning("set_cookies failed: %s", exc)
+
+    async def close(self) -> None:
+        """Close the session and its CDP connection."""
+        if self._cdp and not self._cdp._closed:
+            await self._cdp.close()
