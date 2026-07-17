@@ -142,6 +142,9 @@ class Engine:
             stealth=self.config.stealth,
             user_data_dir=self.config.user_data_dir,
             extra_args=self.config.extra_chrome_args,
+            viewport_width=self.config.viewport_width,
+            viewport_height=self.config.viewport_height,
+            user_agent=self.config.user_agent,
         )
         # Wait for Chrome to become ready
         await asyncio.sleep(1.0)
@@ -172,6 +175,8 @@ class Engine:
 
             return page
         finally:
+            if self._network.enabled:
+                await self._network.stop(client)
             await client.close()
 
     async def _create_chrome_session(self) -> Session:

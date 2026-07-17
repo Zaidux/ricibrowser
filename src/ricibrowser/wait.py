@@ -35,13 +35,22 @@ async def wait_for_content_stable(
         frame_id: Frame ID (for isolated world creation, if needed).
         mode: How to wait:
             "load" — simple readyState check.
-            "domcontentloaded" — even simpler.
-            "networkidle" — poll for DOM stability + network idle.
+            "domcontentloaded" — fastest, least reliable.
+            "networkidle" — poll for DOM stability + check for outstanding
+                network requests (most reliable, but requires Network.enable
+                which is a detection vector).
+            "domstable" — alias for DOM-stability-only (no network check).
         timeout: Max seconds to wait.
     """
     if mode == "domcontentloaded":
         await _wait_ready_state(cdp, "interactive", timeout)
     elif mode == "networkidle":
+        await _wait_ready_state(cdp, "interactive", timeout)
+        await _wait_dom_stable(cdp, timeout)
+        # Best-effort network idle check: poll for pending requests via
+        # CDP. If Network domain isn't enabled, this is a no-op.
+        await _wait_network_idle(cdp, timeout=5.0)
+    elif mode == "domstable":
         await _wait_ready_state(cdp, "interactive", timeout)
         await _wait_dom_stable(cdp, timeout)
     else:  # "load" (default)
@@ -99,3 +108,30 @@ async def _wait_dom_stable(cdp: CDPClient, timeout: float = 10.0) -> None:
             pass
         await asyncio.sleep(0.2)
     logger.debug("wait_dom_stable timeout after %.1fs (stable_count=%d)", timeout, stable_count)
+
+
+async def _wait_network_idle(cdp: CDPClient, timeout: float = 5.0) -> None:
+    """Best-effort network-idle check.
+
+    Polls for outstanding network requests via CDP. If the Network domain
+    isn't enabled (the normal case — Network.enable is a detection vector),
+    this is a no-op and returns immediately. This is intentionally best-effort
+    since true network idle tracking requires the Network domain.
+    """
+    # Check if there are pending requests by evaluating a simple JS counter.
+    # If Network domain isn't enabled, this just falls back to a short delay.
+    import time
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            result = await cdp.send("Runtime.evaluate", {
+                "expression": "window.__ricibrowser_outstanding || 0",
+                "returnByValue": True,
+            })
+            value = result.get("result", {}).get("value", 0)
+            if not value or int(value) == 0:
+                return
+        except CDPError:
+            # If this fails, Network domain likely isn't enabled — just return.
+            return
+        await asyncio.sleep(0.3)

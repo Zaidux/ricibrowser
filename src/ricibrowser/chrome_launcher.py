@@ -74,6 +74,9 @@ def launch_chrome(
     user_data_dir: str | None = None,
     extra_args: list[str] | None = None,
     headless: bool = True,
+    viewport_width: int = 1920,
+    viewport_height: int = 1080,
+    user_agent: str | None = None,
 ) -> subprocess.Popen:
     """Launch Chrome with a remote debugging port for CDP access.
 
@@ -120,31 +123,59 @@ def launch_chrome(
     if headless:
         args.append("--disable-gpu")
 
+    # Apply viewport size
+    if viewport_width and viewport_height:
+        args.append(f"--window-size={viewport_width},{viewport_height}")
+
+    # Apply custom user agent (if set)
+    if user_agent:
+        args.append(f"--user-agent={user_agent}")
+
     logger.info("Launching Chrome: %s (port %d)", chrome_path, port)
-    proc = subprocess.Popen(
-        args,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        stdin=subprocess.DEVNULL,
-        start_new_session=True,  # survives parent exit (setsid)
-    )
+    kwargs: dict[str, Any] = {
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "stdin": subprocess.DEVNULL,
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        kwargs["start_new_session"] = True  # setsid — survives parent exit
+    proc = subprocess.Popen(args, **kwargs)
     logger.info("Chrome launched (PID %d)", proc.pid)
     return proc
 
 
 def stop_chrome(proc: subprocess.Popen) -> None:
-    """Gracefully stop a Chrome process launched by :func:`launch_chrome`."""
+    """Gracefully stop a Chrome process launched by :func:`launch_chrome`.
+
+    Handles both POSIX (process group kill) and Windows (taskkill).
+    """
     if proc.poll() is not None:
         return  # Already exited
-    try:
-        # Try graceful shutdown first
-        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-        proc.wait(timeout=5)
-    except (ProcessLookupError, subprocess.TimeoutExpired):
+    if os.name == "nt":
+        # Windows: no process groups — use taskkill to kill the tree
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=10,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+    else:
+        # POSIX: kill the process group
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            proc.wait(timeout=5)
+        except (ProcessLookupError, subprocess.TimeoutExpired):
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
 
 def get_debug_url(port: int = 9223) -> str:

@@ -93,6 +93,28 @@ class Session:
         self._isolated_context_id: int | None = None
         self._page_enabled = False
         self._current_url: str = ""
+        # Register for frame navigation events so we invalidate the isolated
+        # context when the frame changes (link clicks, SPA navigations, etc.).
+        self._setup_frame_listener()
+
+    def _setup_frame_listener(self) -> None:
+        """Register a CDP event handler that invalidates the isolated context
+        when the main frame navigates (even page-initiated navigations).
+
+        Without this, the cached _isolated_context_id points at a destroyed
+        execution context after a SPA navigation or link click, and
+        evaluate() silently fails with a stale contextId error.
+        """
+        def _on_frame_navigated(params: dict) -> None:
+            # The main frame's id changes on navigation
+            new_frame_id = params.get("frame", {}).get("id", "")
+            if new_frame_id and new_frame_id != self._frame_id:
+                self._frame_id = new_frame_id
+                self._isolated_context_id = None  # Force recreation
+                logger.debug("Frame navigated, isolated context invalidated")
+
+        # Register the callback (sync — the CDPClient handles async dispatch)
+        self._cdp._event_handlers.setdefault("Page.frameNavigated", []).append(_on_frame_navigated)
 
     async def _ensure_page_enabled(self) -> None:
         """Enable the Page domain (needed for navigation events)."""
@@ -203,8 +225,11 @@ class Session:
     async def evaluate(self, expression: str) -> str | None:
         """Evaluate JavaScript in an isolated world and return the result.
 
-        NEVER calls Runtime.enable on the main world — uses Page.createIsolatedWorld
-        to create a separate execution context.
+        NEVER calls Runtime.enable on the main world — uses
+        Page.createIsolatedWorld to create a separate execution context.
+        If the isolated context is unavailable (before first navigate, or
+        after an unobserved frame change), returns None with a warning
+        rather than silently falling back to the main world.
         """
         context_id = await self._get_or_create_isolated_world()
         params: dict[str, Any] = {
@@ -219,6 +244,10 @@ class Session:
             value = result.get("result", {}).get("value")
             return str(value) if value is not None else None
         except CDPError as exc:
+            # If the contextId was stale (frame changed underneath us), reset
+            # and retry once with a fresh isolated world.
+            if "context" in exc.message.lower() or context_id is not None:
+                self._isolated_context_id = None
             logger.warning("JS evaluation failed: %s", exc)
             return None
 
@@ -262,7 +291,8 @@ class Session:
         }})()
         """
         result = await self.evaluate(js)
-        return result == "true"
+        # CDP returns Python bool → str(True) = "True", not "true"
+        return result in ("true", "True") or result is True
 
     async def fill(self, selector: str, value: str, timeout: float = 5.0) -> bool:
         """Fill an input element with a value.
@@ -280,7 +310,7 @@ class Session:
         }})()
         """
         result = await self.evaluate(js)
-        return result == "true"
+        return result in ("true", "True") or result is True
 
     async def get_dom(self) -> str:
         """Return the full rendered DOM HTML."""

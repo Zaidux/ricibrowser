@@ -54,6 +54,7 @@ class NetworkCapture:
         self.flows: list[Flow] = []
         self._pending: dict[str, Flow] = {}
         self._active = False
+        self._MAX_PENDING = 1000  # cap to prevent unbounded memory growth
 
     async def start(self, cdp: CDPClient) -> None:
         """Enable network capture. This calls CDP Network.enable (detection vector!).
@@ -63,6 +64,8 @@ class NetworkCapture:
         if not self.enabled or self._active:
             return
         self._active = True
+        self._pending.clear()
+        self.flows.clear()
 
         await cdp.on_event("Network.requestWillBeSent", self._on_request)
         await cdp.on_event("Network.responseReceived", self._on_response)
@@ -81,6 +84,10 @@ class NetworkCapture:
         if not self._active:
             return
         self._active = False
+        # Move any pending flows to completed (they never got a terminal event)
+        for flow in self._pending.values():
+            self.flows.append(flow)
+        self._pending.clear()
         try:
             await cdp.send("Network.disable")
         except CDPError:
@@ -88,6 +95,13 @@ class NetworkCapture:
 
     async def _on_request(self, params: dict) -> None:
         """Handle Network.requestWillBeSent."""
+        if not self._active:
+            return
+        # Evict oldest if at capacity (prevents unbounded growth from
+        # flows that never get a terminal event — SSE, WebSocket upgrades).
+        if len(self._pending) >= self._MAX_PENDING:
+            oldest_key = next(iter(self._pending))
+            self.flows.append(self._pending.pop(oldest_key))
         flow = Flow(
             request_id=params.get("requestId", ""),
             url=params.get("request", {}).get("url", ""),
@@ -101,6 +115,8 @@ class NetworkCapture:
 
     async def _on_response(self, params: dict) -> None:
         """Handle Network.responseReceived."""
+        if not self._active:
+            return
         req_id = params.get("requestId", "")
         flow = self._pending.get(req_id)
         if flow:

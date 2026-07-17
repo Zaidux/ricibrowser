@@ -51,14 +51,22 @@ class CookieJar:
             self._data = {"cookies": [], "storage": {}}
 
     def save(self) -> None:
-        """Save the jar to disk."""
+        """Save the jar to disk (atomic write with unique temp file)."""
         if not self.path:
             return
-        os.makedirs(os.path.dirname(self.path), exist_ok=True)
-        tmp = self.path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(self._data, f, indent=2, default=str)
-        os.replace(tmp, self.path)
+        dir_path = os.path.dirname(self.path) or "."
+        os.makedirs(dir_path, exist_ok=True)
+        # Use NamedTemporaryFile for a unique temp name (avoids concurrent-write
+        # collision on the same .tmp path).
+        import tempfile
+        fd, tmp = tempfile.mkstemp(dir=dir_path, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(self._data, f, indent=2, default=str)
+            os.replace(tmp, self.path)
+        except Exception:
+            os.unlink(tmp)
+            raise
 
     @property
     def cookies(self) -> list[dict]:
@@ -77,14 +85,22 @@ class CookieJar:
         self._data["cookies"] = list(existing.values())
 
     def get_cookies_for_domain(self, domain: str) -> list[dict]:
-        """Get cookies matching a domain (handles leading dot)."""
+        """Get cookies matching a domain (handles leading dot).
+
+        Uses proper suffix-boundary matching: ``.example.com`` matches
+        ``example.com`` and ``www.example.com`` but NOT ``notexample.com``.
+        """
         result = []
         for c in self.cookies:
             cdomain = c.get("domain", "")
             if cdomain == domain:
                 result.append(c)
-            elif cdomain.startswith(".") and domain.endswith(cdomain[1:]):
-                result.append(c)
+            elif cdomain.startswith("."):
+                # Dot domain: must be a suffix at a dot boundary
+                bare = cdomain[1:]  # "example.com"
+                if domain == bare or domain.endswith(cdomain):
+                    # domain.endswith(".example.com") ensures boundary
+                    result.append(c)
         return result
 
     def get_storage(self, origin: str) -> dict:

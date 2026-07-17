@@ -136,14 +136,14 @@ class MiniProxyIntegration:
             return []
 
         try:
-            conn = sqlite3.connect(self.db_path)
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute(
-                "SELECT * FROM requests WHERE id > ? ORDER BY id DESC LIMIT ?",
-                (since_id, limit),
-            ).fetchall()
-            conn.close()
-            return [dict(r) for r in rows]
+            with sqlite3.connect(self.db_path, timeout=30) as conn:
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA journal_mode=WAL")
+                rows = conn.execute(
+                    "SELECT * FROM requests WHERE id > ? ORDER BY id DESC LIMIT ?",
+                    (since_id, limit),
+                ).fetchall()
+                return [dict(r) for r in rows]
         except Exception as exc:
             logger.warning("Failed to read miniproxy DB: %s", exc)
             return []

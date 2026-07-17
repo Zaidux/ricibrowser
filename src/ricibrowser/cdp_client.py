@@ -98,13 +98,22 @@ class CDPClient:
 
         # Find the target
         target = None
-        for t in targets:
-            if target_id and t.get("id") == target_id:
-                target = t
-                break
-            if t.get("type") == "page":
-                target = t
-                break
+        if target_id:
+            # When a specific target_id is requested, search exclusively for it.
+            # Don't fall back to "first page target" — that could match an
+            # unrelated tab.
+            for t in targets:
+                if t.get("id") == target_id:
+                    target = t
+                    break
+            if target is None:
+                raise CDPError("connect_to_target", -1,
+                               f"Target {target_id} not found in CDP target list")
+        else:
+            for t in targets:
+                if t.get("type") == "page":
+                    target = t
+                    break
 
         if target is None:
             # Create a new tab if none exists
@@ -150,14 +159,14 @@ class CDPClient:
         try:
             await self._ws.send(json.dumps(msg))
         except Exception as exc:
-            del self._pending[msg_id]
+            self._pending.pop(msg_id, None)
             raise CDPError(method, -1, f"WebSocket send failed: {exc}") from exc
 
         try:
             result = await asyncio.wait_for(future, timeout=120.0)
             return result
         except asyncio.TimeoutError:
-            del self._pending[msg_id]
+            self._pending.pop(msg_id, None)
             raise CDPError(method, -1, f"Timeout waiting for response to {method}")
 
     async def on_event(self, event_name: str, callback: CDPEventCallback) -> None:
@@ -213,6 +222,9 @@ class CDPClient:
         except Exception:
             logger.exception("CDP: recv loop crashed")
         finally:
+            # Mark as closed so send() fast-fails and callers reconnect
+            # instead of queuing futures that will never resolve.
+            self._closed = True
             # Reject any pending futures
             for fut in list(self._pending.values()):
                 if not fut.done():

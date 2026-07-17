@@ -57,7 +57,8 @@ class LightpandaEngine:
     async def is_available(ws_url: str = "ws://127.0.0.1:9222") -> bool:
         """Check if a Lightpanda instance is reachable at the given URL.
 
-        Tries the HTTP /json/version endpoint that Lightpanda exposes.
+        Requires Lightpanda to identify itself in the Browser field.
+        Does NOT return True for non-Lightpanda CDP servers (Chrome, etc.).
         """
         http_url = ws_url.replace("ws://", "http://").replace("wss://", "https://")
         try:
@@ -65,9 +66,10 @@ class LightpandaEngine:
                 resp = await http.get(f"{http_url}/json/version")
                 if resp.status_code == 200:
                     data = resp.json()
-                    # Lightpanda identifies itself in the Browser field
                     browser = str(data.get("Browser", "")).lower()
-                    return "lightpanda" in browser or "Browser" in data
+                    # Only return True for actual Lightpanda instances.
+                    # Chrome identifies as "Chrome/xxx", not "lightpanda".
+                    return "lightpanda" in browser
         except Exception:
             pass
         return False
