@@ -158,7 +158,12 @@ class Engine:
     # ── CDP-Chrome path ────────────────────────────────────────────
 
     async def _ensure_chrome(self) -> str:
-        """Ensure Chrome is running and return its debug URL."""
+        """Ensure Chrome is running and return its debug URL.
+
+        Launches Chrome if needed, then polls until the CDP HTTP endpoint is
+        reachable (Chrome takes ~1-2s to start listening). This fixes the
+        "All connection attempts failed" error when Chrome is slow to start.
+        """
         if self._chrome_proc and self._chrome_proc.poll() is None:
             return get_debug_url(self.config.chrome_debug_port)
 
@@ -172,9 +177,24 @@ class Engine:
             viewport_height=self.config.viewport_height,
             user_agent=self.config.user_agent,
         )
-        # Wait for Chrome to become ready
-        await asyncio.sleep(1.0)
-        return get_debug_url(self.config.chrome_debug_port)
+
+        # Poll until Chrome's CDP endpoint is reachable (Chrome takes ~1-2s).
+        # Without this, a fast connect_to_target fails with "All connection
+        # attempts failed" because Chrome hasn't started listening yet.
+        debug_url = get_debug_url(self.config.chrome_debug_port)
+        import httpx
+        for attempt in range(10):
+            await asyncio.sleep(0.5)
+            try:
+                async with httpx.AsyncClient(timeout=2.0) as http:
+                    resp = await http.get(f"{debug_url}/json/version")
+                    if resp.status_code == 200:
+                        logger.info("Chrome ready after %d polls", attempt + 1)
+                        return debug_url
+            except Exception:
+                continue
+        logger.warning("Chrome did not become ready after 5s — proceeding anyway")
+        return debug_url
 
     async def _browse_chrome(self, url: str, max_chars: int, **kwargs) -> Page:
         """Browse via CDP-Chrome (thorough path)."""
