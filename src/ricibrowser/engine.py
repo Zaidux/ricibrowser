@@ -17,6 +17,11 @@ from ricibrowser.chrome_launcher import get_debug_url, launch_chrome, stop_chrom
 from ricibrowser.cdp_client import CDPClient, CDPError
 from ricibrowser.config import EngineConfig, EngineType
 from ricibrowser.cookie_jar import CookieJar
+from ricibrowser.fingerprint import FingerprintShield
+from ricibrowser.geolocation import GEO_PROFILES, GeolocationManager
+from ricibrowser.captcha import CaptchaHandler, CloudflareAutoSolver
+from ricibrowser.headers import HeaderManager
+from ricibrowser.input import HumanMouse
 from ricibrowser.lightpanda import LightpandaEngine
 from ricibrowser.network import NetworkCapture
 from ricibrowser.session import Page, Session
@@ -43,6 +48,17 @@ class Engine:
         self._cookie_jar = CookieJar(self.config.cookie_jar_path)
         self._cookie_jar.load()
         self._network = NetworkCapture(enabled=self.config.debug_network)
+        # ── Extension modules ──────────────────────────────────────
+        self._fingerprint = FingerprintShield(enabled=self.config.fingerprint_shield)
+        geo_profile = None
+        if self.config.geolocation_profile:
+            geo_profile = GEO_PROFILES.get(self.config.geolocation_profile)
+        self._geolocation = GeolocationManager(profile=geo_profile)
+        self._captcha_handler = CaptchaHandler(
+            auto_solver=CloudflareAutoSolver() if self.config.cloudflare_auto_resolve else None,
+        )
+        self._header_manager = HeaderManager()
+        self._human_mouse: HumanMouse | None = None  # Per-session
 
     @property
     def cookie_jar(self) -> CookieJar:
@@ -51,6 +67,16 @@ class Engine:
     @property
     def network(self) -> NetworkCapture:
         return self._network
+
+    @property
+    def captcha_handler(self) -> CaptchaHandler:
+        """Get the CAPTCHA handler for detecting/solving challenges."""
+        return self._captcha_handler
+
+    @property
+    def human_mouse(self) -> HumanMouse | None:
+        """Get the human mouse simulator (None if not enabled)."""
+        return self._human_mouse
 
     async def fast_browse(self, url: str, max_chars: int = 6000, **kwargs) -> Page:
         """Browse a URL using the fast engine (Lightpanda by default).
@@ -180,7 +206,7 @@ class Engine:
             await client.close()
 
     async def _create_chrome_session(self) -> Session:
-        """Create a persistent session via CDP-Chrome."""
+        """Create a persistent session via CDP-Chrome with all extensions applied."""
         debug_url = await self._ensure_chrome()
         client = await CDPClient.connect_to_target(debug_url)
         session = Session(client, engine_name="cdp_chrome")
@@ -192,5 +218,25 @@ class Engine:
         # Start network capture if enabled
         if self._network.enabled:
             await self._network.start(client)
+
+        # ── Apply extension modules ────────────────────────────────
+        # Fingerprint shield (canvas/WebGL/audio randomization)
+        if self._fingerprint.enabled:
+            await self._fingerprint.apply(client)
+
+        # Geolocation consistency (timezone/locale/geo override)
+        await self._geolocation.apply(client)
+
+        # Header consistency (Sec-CH-UA matches UA)
+        if self.config.header_consistency:
+            await self._header_manager.apply(client)
+
+        # Human mouse input (bezier-curve movement)
+        if self.config.human_input:
+            self._human_mouse = HumanMouse(
+                client,
+                viewport_width=self.config.viewport_width,
+                viewport_height=self.config.viewport_height,
+            )
 
         return session

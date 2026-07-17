@@ -55,6 +55,17 @@ class EngineConfig:
     user_agent: str | None = None
     timeout: float = 30.0
     extra_chrome_args: list[str] = field(default_factory=list)
+    # ── Extension modules (opt-in) ──────────────────────────────────
+    fingerprint_shield: bool = False
+    """Canvas/WebGL/audio fingerprint randomization (opt-in, uses JS injection)."""
+    geolocation_profile: str | None = None
+    """Geographic profile name ('us_east', 'uk', 'japan', etc.) for timezone/locale/geo consistency."""
+    cloudflare_auto_resolve: bool = True
+    """Auto-resolve Cloudflare JS challenges by waiting for native JS execution."""
+    human_input: bool = False
+    """Use human-like mouse movement (bezier curves + timing) for clicks."""
+    header_consistency: bool = False
+    """Ensure Sec-CH-UA and request headers match a real Chrome release."""
 
     def __post_init__(self) -> None:
         if isinstance(self.fast_engine, str):

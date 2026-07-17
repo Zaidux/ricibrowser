@@ -9,6 +9,13 @@ Two engines:
   - **CDP-Chrome** (thorough path): custom CDP client driving the user's real
     installed Chrome. For DAST/JS-heavy targets/auth flow testing/anti-bot.
 
+Extensions:
+  - **fingerprint**: Canvas/WebGL/audio fingerprint randomization (opt-in).
+  - **geolocation**: Timezone/locale/geolocation override + proxy rotation pool.
+  - **captcha**: CAPTCHA detection, Cloudflare auto-resolve, solver hooks.
+  - **input**: Human-like mouse movement simulation (bezier curves + timing).
+  - **headers**: Sec-CH-UA consistency + request header ordering.
+
 Usage::
 
     from ricibrowser import Engine, EngineConfig, EngineType
@@ -27,5 +34,5 @@ from ricibrowser.config import EngineConfig, EngineType
 from ricibrowser.engine import Engine
 from ricibrowser.session import Page, Session
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __all__ = ["Engine", "EngineConfig", "EngineType", "Page", "Session"]
