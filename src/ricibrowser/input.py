@@ -164,31 +164,12 @@ class HumanMouse:
     async def click_element(self, session, selector: str) -> bool:
         """Move + click a DOM element by CSS selector.
 
-        Gets the element's bounding box via JS, moves to its center (with
-        jitter), and clicks. Falls back to session.click() if box retrieval
-        fails.
+        Gets the element's bounding box via a single JS evaluation (returns
+        JSON), moves to its center (with jitter), and clicks. Falls back to
+        session.click() if box retrieval fails.
         """
-        # Get element bounding box
+        # Single evaluation — returns JSON with coordinates or null.
         box_js = f"""
-        (function() {{
-            var el = document.querySelector({selector!r});
-            if (!el) return null;
-            var rect = el.getBoundingClientRect();
-            return {{
-                x: rect.x + rect.width / 2,
-                y: rect.y + rect.height / 2,
-                found: true
-            }};
-        }})()
-        """
-        result = await session.evaluate(box_js)
-        if not result or "true" not in str(result).lower():
-            # Fallback: just use session.click
-            return await session.click(selector)
-
-        # Parse the box from the result
-        # CDP returns the value — we need to extract x/y
-        box_js2 = f"""
         (function() {{
             var el = document.querySelector({selector!r});
             if (!el) return JSON.stringify(null);
@@ -196,17 +177,17 @@ class HumanMouse:
             return JSON.stringify({{x: rect.x + rect.width / 2, y: rect.y + rect.height / 2}});
         }})()
         """
-        box_result = await session.evaluate(box_js2)
+        box_result = await session.evaluate(box_js)
         if box_result:
             try:
                 import json
                 box = json.loads(box_result)
-                if box:
+                if box and "x" in box:
                     await self.click_at(box["x"], box["y"])
                     return True
-            except (json.JSONDecodeError, KeyError, TypeError):
-                pass
-
+            except (json.JSONDecodeError, TypeError) as exc:
+                logger.warning("click_element: JSON parse failed for %s: %s", selector, exc)
+        # Fallback: use session.click
         return await session.click(selector)
 
     async def type_text(self, session, selector: str, text: str) -> bool:

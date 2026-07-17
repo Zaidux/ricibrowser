@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 # the same way Runtime.enable is).
 _CANVAS_NOISE_JS = """
 // ricibrowser fingerprint randomization — runs before page scripts.
-(function() {
+(function() {{
     // Per-session noise seed (stable within a session, different across).
     var _seed = {seed};
 
@@ -48,19 +48,37 @@ _CANVAS_NOISE_JS = """
     }}
 
     // ── Canvas fingerprint defense ──────────────────────────────────
+    // Override toDataURL: applies per-session-stable noise WITHOUT
+    // writing back to the canvas (putImageData would cause cumulative
+    // drift on repeated calls — a detectable behavioral signal).
     var _origToDataURL = HTMLCanvasElement.prototype.toDataURL;
     HTMLCanvasElement.prototype.toDataURL = function(type) {{
         var ctx = this.getContext('2d');
         if (ctx && this.width > 0 && this.height > 0) {{
             try {{
-                var imageData = ctx.getImageData(0, 0, Math.min(this.width, 16), Math.min(this.height, 16));
+                // Extract image data, noise a COPY, and base64-encode
+                // the noised copy — the visible canvas stays untouched.
+                var w = Math.min(this.width, 100);
+                var h = Math.min(this.height, 100);
+                var imageData = ctx.getImageData(0, 0, w, h);
                 var data = imageData.data;
                 for (var i = 0; i < data.length; i += 4) {{
-                    // Add ±1 noise to R channel (invisible but changes hash).
-                    data[i] = Math.max(0, Math.min(255, data[i] + (_noise(i, 0, _seed) * 2)));
+                    // Deterministic per-session noise (same canvas → same noise)
+                    var n = _noise(i, 0, _seed) * 2;
+                    data[i] = Math.max(0, Math.min(255, data[i] + n));
                 }}
-                ctx.putImageData(imageData, 0, 0);
-            }} catch(e) {{}}  // CORS-restricted canvases skip.
+                // Draw noised copy to a temporary offscreen canvas
+                var tmp = document.createElement('canvas');
+                tmp.width = this.width;
+                tmp.height = this.height;
+                var tmpCtx = tmp.getContext('2d');
+                // Copy original canvas
+                tmpCtx.drawImage(this, 0, 0);
+                // Apply noised data to the temp canvas only
+                tmpCtx.putImageData(imageData, 0, 0);
+                // Return the noised temp canvas's data URL
+                return _origToDataURL.call(tmp, arguments);
+            }} catch(e) {{}}  // CORS-restricted canvases skip
         }}
         return _origToDataURL.apply(this, arguments);
     }};

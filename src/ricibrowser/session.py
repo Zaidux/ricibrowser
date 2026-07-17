@@ -251,6 +251,23 @@ class Session:
             logger.warning("JS evaluation failed: %s", exc)
             return None
 
+    async def evaluate_bool(self, expression: str) -> bool | None:
+        """Evaluate a JS expression that returns a boolean.
+
+        Returns True/False, or None if evaluation failed or returned
+        a non-boolean value. Centralizes the str(bool) comparison so
+        callers don't need magic tuples.
+        """
+        result = await self.evaluate(expression)
+        if result is None:
+            return None
+        # CDP returns Python bool → str(True) = "True"
+        if result in ("true", "True"):
+            return True
+        if result in ("false", "False"):
+            return False
+        return None
+
     async def screenshot(self, path: str | None = None, full_page: bool = False) -> str:
         """Take a screenshot and save to a PNG file.
 

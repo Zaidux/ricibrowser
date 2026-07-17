@@ -21,6 +21,48 @@ from ricibrowser.geolocation import (
 )
 from ricibrowser.headers import ChromeVersion, DEFAULT_CHROME, detect_chrome_version
 from ricibrowser.input import HumanMouse
+from ricibrowser.session import Session
+
+
+# ── Session.evaluate_bool ────────────────────────────────────────────
+
+class TestEvaluateBool:
+    @pytest.mark.asyncio
+    async def test_eval_true(self):
+        """evaluate_bool returns True when CDP returns Python True (str=True → 'True')."""
+        from ricibrowser.cdp_client import CDPClient, CDPError
+        client = MagicMock()
+        client.send = AsyncMock(return_value={"result": {"value": True}})
+        client._closed = False
+        client._event_handlers = {}
+        client._pending = {}
+        session = Session(client)
+        result = await session.evaluate_bool("1==1")
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_eval_false(self):
+        from ricibrowser.cdp_client import CDPClient
+        client = MagicMock()
+        client.send = AsyncMock(return_value={"result": {"value": False}})
+        client._closed = False
+        client._event_handlers = {}
+        client._pending = {}
+        session = Session(client)
+        result = await session.evaluate_bool("1==2")
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_eval_none(self):
+        from ricibrowser.cdp_client import CDPClient, CDPError
+        client = MagicMock()
+        client.send = AsyncMock(side_effect=CDPError("test", -1, "fail"))
+        client._closed = False
+        client._event_handlers = {}
+        client._pending = {}
+        session = Session(client)
+        result = await session.evaluate_bool("nah")
+        assert result is None
 
 
 # ── Fingerprint ──────────────────────────────────────────────────────
@@ -49,6 +91,18 @@ class TestFingerprintShield:
         cdp.send = AsyncMock()
         await shield.apply(cdp)
         cdp.send.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_apply_injects_script_when_enabled(self):
+        shield = FingerprintShield(enabled=True)
+        cdp = MagicMock()
+        cdp.send = AsyncMock(return_value={"identifier": "script_123"})
+        await shield.apply(cdp)
+        cdp.send.assert_called_once()
+        call_args = cdp.send.call_args
+        assert call_args[0][0] == "Page.addScriptToEvaluateOnNewDocument"
+        assert shield._applied is True
+        assert shield._script_identifier == "script_123"
 
 
 # ── Geolocation ──────────────────────────────────────────────────────
@@ -109,6 +163,7 @@ class TestCaptchaDetection:
     async def test_no_captcha(self):
         session = MagicMock()
         session.evaluate = AsyncMock(return_value="Welcome to the site")
+        session.evaluate_bool = AsyncMock(return_value=False)
         result = await detect_captcha(session)
         assert result == CaptchaType.NONE
 
@@ -162,6 +217,30 @@ class TestCloudflareAutoSolver:
         assert result.solved is False
         assert "did not auto-resolve" in (result.error or "")
 
+    @pytest.mark.asyncio
+    async def test_solve_eval_returns_none_keeps_waiting(self):
+        """When evaluate returns None (context not ready), solver should NOT
+        falsely report solved — it should keep waiting (fail-closed)."""
+        session = MagicMock()
+        session.evaluate = AsyncMock(return_value=None)  # Always None
+        session.get_cookies = AsyncMock(return_value=[])
+
+        solver = CloudflareAutoSolver(max_wait=0.5, poll_interval=0.1)
+        result = await solver.solve(session)
+        assert result.solved is False
+        assert "did not auto-resolve" in (result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_solve_empty_body_keeps_waiting(self):
+        """Empty body text should NOT be treated as 'challenge cleared'."""
+        session = MagicMock()
+        session.evaluate = AsyncMock(return_value="")
+        session.get_cookies = AsyncMock(return_value=[])
+
+        solver = CloudflareAutoSolver(max_wait=0.5, poll_interval=0.1)
+        result = await solver.solve(session)
+        assert result.solved is False
+
 
 class TestCaptchaHandler:
     @pytest.mark.asyncio
@@ -169,6 +248,7 @@ class TestCaptchaHandler:
         handler = CaptchaHandler()
         session = MagicMock()
         session.evaluate = AsyncMock(return_value="Welcome")
+        session.evaluate_bool = AsyncMock(return_value=False)
         result = await handler.detect_and_solve(session)
         assert result.solved is True
         assert result.captcha_type == CaptchaType.NONE

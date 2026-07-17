@@ -224,8 +224,10 @@ class Engine:
         if self._fingerprint.enabled:
             await self._fingerprint.apply(client)
 
-        # Geolocation consistency (timezone/locale/geo override)
-        await self._geolocation.apply(client)
+        # Geolocation consistency (timezone/locale/geo override) — only
+        # when the operator explicitly requested a geographic profile.
+        if self.config.geolocation_profile:
+            await self._geolocation.apply(client)
 
         # Header consistency (Sec-CH-UA matches UA)
         if self.config.header_consistency:

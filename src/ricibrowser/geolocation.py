@@ -164,41 +164,54 @@ class GeolocationManager:
 
         Sets timezone, locale, geolocation override, and device metrics
         so they're all consistent (prevents timezone/locale mismatch
-        fingerprinting).
+        fingerprinting). Only sets ``_applied = True`` if ALL commands
+        succeed; partial application is logged as a warning.
         """
         p = self.profile
+        parts_applied: list[str] = []
+
         try:
-            # Timezone override
             await cdp.send("Emulation.setTimezoneOverride", {"timezoneId": p.timezone})
+            parts_applied.append("timezone")
         except CDPError:
             pass
 
         try:
-            # Locale override
             await cdp.send("Emulation.setLocaleOverride", {"locale": p.locale})
+            parts_applied.append("locale")
         except CDPError:
             pass
 
         try:
-            # Geolocation override
             await cdp.send("Emulation.setGeolocationOverride", {
                 "latitude": p.latitude,
                 "longitude": p.longitude,
                 "accuracy": p.accuracy,
             })
+            parts_applied.append("geolocation")
         except CDPError:
             pass
 
         try:
-            # Device metrics (screen size + scale factor)
             await cdp.send("Emulation.setDeviceMetricsOverride", {
                 "width": p.screen_width,
                 "height": p.screen_height,
                 "deviceScaleFactor": p.device_scale_factor,
                 "mobile": False,
             })
+            parts_applied.append("device_metrics")
         except CDPError:
             pass
 
-        self._applied = True
-        logger.info("Geolocation applied: %s (%s)", p.timezone, p.locale)
+        if len(parts_applied) == 4:
+            self._applied = True
+            logger.info("Geolocation applied: %s (%s)", p.timezone, p.locale)
+        else:
+            self._applied = False
+            logger.warning(
+                "Geolocation PARTIALLY applied: %s (missing: %s). "
+                "This may create a fingerprint inconsistency.",
+                parts_applied,
+                ["timezone", "locale", "geolocation", "device_metrics"]
+                - set(parts_applied),  # type: ignore
+            )

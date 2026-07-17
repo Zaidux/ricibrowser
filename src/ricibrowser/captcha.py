@@ -148,37 +148,37 @@ async def detect_captcha(session) -> CaptchaType:
         return CaptchaType.CLOUDFLARE_JS
 
     # Check for Cloudflare Turnstile widget
-    turnstile = await session.evaluate(
+    turnstile = await session.evaluate_bool(
         "document.querySelector('.cf-turnstile, [data-sitekey]') !== null"
     )
-    if turnstile in ("True", "true", True):
+    if turnstile:
         # Verify it's actually a Turnstile widget (not reCAPTCHA)
-        is_turnstile = await session.evaluate(
+        is_turnstile = await session.evaluate_bool(
             "document.querySelector('script[src*=\"challenges.cloudflare.com/turnstile\"]') !== null"
         )
-        if is_turnstile in ("True", "true", True):
+        if is_turnstile:
             return CaptchaType.CLOUDFLARE_TURNSTILE
 
     # Check for reCAPTCHA
-    recaptcha = await session.evaluate(
+    recaptcha = await session.evaluate_bool(
         "document.querySelector('.g-recaptcha, [data-sitekey], "
         "iframe[src*=\"recaptcha\"]') !== null"
     )
-    if recaptcha in ("True", "true", True):
+    if recaptcha:
         # Check if it's v2 (visible checkbox) or v3 (invisible)
-        visible = await session.evaluate(
+        visible = await session.evaluate_bool(
             "document.querySelector('.g-recaptcha') && "
             "getComputedStyle(document.querySelector('.g-recaptcha')).display !== 'none'"
         )
-        if visible in ("True", "true", True):
+        if visible:
             return CaptchaType.RECAPTCHA_V2
         return CaptchaType.RECAPTCHA_V3
 
     # Check for hCaptcha
-    hcaptcha = await session.evaluate(
+    hcaptcha = await session.evaluate_bool(
         "document.querySelector('.h-captcha, iframe[src*=\"hcaptcha\"]') !== null"
     )
-    if hcaptcha in ("True", "true", True):
+    if hcaptcha:
         return CaptchaType.HCAPTCHA
 
     # Generic anti-bot check
@@ -237,15 +237,25 @@ class CloudflareAutoSolver:
             # Check if the challenge has cleared
             body_text = await session.evaluate(
                 "document.body ? document.body.innerText.substring(0, 200) : ''"
-            ) or ""
+            )
 
-            text_lower = (body_text or "").lower()
+            # If evaluate returned None (context not ready, CDP error),
+            # treat as "unknown — keep waiting" rather than "cleared".
+            if body_text is None:
+                await asyncio.sleep(self.poll_interval)
+                continue
+
+            text_lower = body_text.lower()
 
             # Challenge cleared if the "Just a moment" / "Checking" text is gone
-            challenge_cleared = not any(p in text_lower for p in(
-                "just a moment", "checking your browser", "attention required",
-                "enable javascript and cookies",
-            ))
+            # AND there is some actual body content (not empty).
+            challenge_cleared = (
+                bool(body_text.strip())
+                and not any(p in text_lower for p in(
+                    "just a moment", "checking your browser", "attention required",
+                    "enable javascript and cookies",
+                ))
+            )
 
             if challenge_cleared:
                 # Verify cf_clearance cookie was set
