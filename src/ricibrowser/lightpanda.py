@@ -52,6 +52,7 @@ class LightpandaEngine:
         self.timeout = timeout
         self._client: CDPClient | None = None
         self._started = False
+        self._target_id: str = ""  # created in start()
 
     @staticmethod
     async def is_available(ws_url: str = "ws://127.0.0.1:9222") -> bool:
@@ -80,14 +81,30 @@ class LightpandaEngine:
         return self.ws_url.replace("ws://", "http://").replace("wss://", "https://")
 
     async def start(self) -> None:
-        """Connect to the Lightpanda CDP endpoint."""
+        """Connect to the Lightpanda CDP endpoint and create a browser context.
+
+        Lightpanda requires an explicit Target.createTarget + attachToTarget
+        before Page.navigate works (unlike Chrome, which auto-creates a page
+        target on connect). We create one on start so browse() can navigate.
+        """
         if self._started:
             return
         # Lightpanda exposes the CDP WS endpoint at the root path (not
         # /devtools/browser/<id> like Chrome). Connect directly.
         self._client = await CDPClient.connect(self.ws_url)
         self._started = True
-        logger.info("Lightpanda engine connected to %s", self.ws_url)
+
+        # Create a browser context — Lightpanda requires this before Page.navigate
+        try:
+            target_result = await self._client.send("Target.createTarget", {"url": "about:blank"})
+            self._target_id = target_result.get("targetId", "")
+            await self._client.send("Target.attachToTarget", {
+                "targetId": self._target_id,
+                "flatten": True,
+            })
+            logger.info("Lightpanda engine connected to %s (target=%s)", self.ws_url, self._target_id)
+        except Exception as exc:
+            logger.warning("Lightpanda Target.createTarget failed (may be older version): %s", exc)
 
     async def stop(self) -> None:
         """Disconnect from Lightpanda."""
