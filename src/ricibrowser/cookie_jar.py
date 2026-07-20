@@ -41,7 +41,8 @@ class CookieJar:
         if not self.path or not os.path.exists(self.path):
             return
         try:
-            self._data = json.loads(open(self.path, encoding="utf-8").read())
+            with open(self.path, encoding="utf-8") as file:
+                self._data = json.load(file)
             if "cookies" not in self._data:
                 self._data["cookies"] = []
             if "storage" not in self._data:
@@ -63,6 +64,7 @@ class CookieJar:
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(self._data, f, indent=2, default=str)
+            os.chmod(tmp, 0o600)
             os.replace(tmp, self.path)
         except Exception:
             os.unlink(tmp)

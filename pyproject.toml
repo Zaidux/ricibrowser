@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ricibrowser"
-version = "0.2.3"
+version = "0.2.4"
 description = "A lightweight two-engine browser automation module built on CDP — no Playwright, no Puppeteer"
 readme = "README.md"
 license = {text = "MIT"}
@@ -51,3 +51,4 @@ ricibrowser = ["py.typed"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+pythonpath = ["src"]

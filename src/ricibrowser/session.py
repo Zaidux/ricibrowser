@@ -11,6 +11,7 @@ A :class:`Page` is the immutable result of a browse/navigate operation.
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import os
 import tempfile
@@ -147,7 +148,7 @@ class Session:
             logger.warning("Could not create isolated world: %s", exc)
             return None
 
-    async def navigate(self, url: str, wait_until: str = "load") -> Page:
+    async def navigate(self, url: str, wait_until: str = "load", max_chars: int = 10_000) -> Page:
         """Navigate to a URL and wait for the page to settle.
 
         Args:
@@ -182,13 +183,21 @@ class Session:
         from ricibrowser.wait import wait_for_content_stable
         await wait_for_content_stable(self._cdp, self._frame_id, mode=wait_until)
 
-        return await self._capture_page(url)
+        return await self._capture_page(url, max_chars=max_chars)
 
-    async def _capture_page(self, url: str) -> Page:
+    async def _capture_page(self, url: str, max_chars: int = 10_000) -> Page:
         """Capture the current page state into a Page object."""
-        title = await self.evaluate("document.title") or ""
-        html = await self.evaluate("document.documentElement.outerHTML") or ""
-        text = await self.evaluate("document.body ? document.body.innerText : ''") or ""
+        snapshot = await self.evaluate_value("""({
+            title: document.title || '',
+            html: document.documentElement ? document.documentElement.outerHTML : '',
+            text: document.body ? document.body.innerText : '',
+            url: location.href
+        })""")
+        snapshot = snapshot if isinstance(snapshot, dict) else {}
+        title = str(snapshot.get("title", ""))
+        html = str(snapshot.get("html", ""))
+        text = str(snapshot.get("text", ""))
+        final_url = str(snapshot.get("url", "") or self._current_url)
 
         if not text and html:
             text = strip_html(html)
@@ -205,18 +214,19 @@ class Session:
         is_cf, cf_type = detect_cloudflare(html, title)
 
         # Truncate
-        truncated_text, was_truncated = truncate(text)
+        truncated_text, text_truncated = truncate(text, max_chars)
+        truncated_html, html_truncated = truncate(html, max(max_chars * 4, 20_000))
 
         return Page(
             url=url,
-            final_url=self._current_url,
+            final_url=final_url,
             status_code=status_code,
             title=title,
             text=truncated_text,
-            html=html,
+            html=truncated_html,
             links=links,
             cookies=cookies,
-            truncated=was_truncated,
+            truncated=text_truncated or html_truncated,
             cloudflare_challenge=is_cf,
             cloudflare_type=cf_type,
             engine=self._engine_name,
@@ -231,23 +241,37 @@ class Session:
         after an unobserved frame change), returns None with a warning
         rather than silently falling back to the main world.
         """
+        value = await self.evaluate_value(expression)
+        return str(value) if value is not None else None
+
+    async def evaluate_value(self, expression: str) -> Any:
+        """Evaluate in the isolated world and preserve JSON-compatible types."""
         context_id = await self._get_or_create_isolated_world()
+        if context_id is None:
+            logger.warning("JS evaluation skipped: isolated context unavailable")
+            return None
         params: dict[str, Any] = {
             "expression": expression,
             "returnByValue": True,
         }
-        if context_id is not None:
-            params["contextId"] = context_id
+        params["contextId"] = context_id
 
         try:
             result = await self._cdp.send("Runtime.evaluate", params)
-            value = result.get("result", {}).get("value")
-            return str(value) if value is not None else None
+            return result.get("result", {}).get("value")
         except CDPError as exc:
             # If the contextId was stale (frame changed underneath us), reset
             # and retry once with a fresh isolated world.
-            if "context" in exc.message.lower() or context_id is not None:
+            if "context" in exc.message.lower():
                 self._isolated_context_id = None
+                retry_context = await self._get_or_create_isolated_world()
+                if retry_context is not None:
+                    params["contextId"] = retry_context
+                    try:
+                        result = await self._cdp.send("Runtime.evaluate", params)
+                        return result.get("result", {}).get("value")
+                    except CDPError:
+                        pass
             logger.warning("JS evaluation failed: %s", exc)
             return None
 
@@ -299,9 +323,10 @@ class Session:
     async def click(self, selector: str, timeout: float = 5.0) -> bool:
         """Click an element matching a CSS selector.
         Returns True if the click succeeded."""
+        selector_json = json.dumps(selector)
         js = f"""
         (function() {{
-            const el = document.querySelector({selector!r});
+            const el = document.querySelector({selector_json});
             if (!el) return false;
             el.click();
             return true;
@@ -315,12 +340,13 @@ class Session:
         """Fill an input element with a value.
         Returns True if the fill succeeded."""
         # Escape the value for JS string injection
-        escaped = value.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n")
+        selector_json = json.dumps(selector)
+        value_json = json.dumps(value)
         js = f"""
         (function() {{
-            const el = document.querySelector({selector!r});
+            const el = document.querySelector({selector_json});
             if (!el) return false;
-            el.value = '{escaped}';
+            el.value = {value_json};
             el.dispatchEvent(new Event('input', {{bubbles: true}}));
             el.dispatchEvent(new Event('change', {{bubbles: true}}));
             return true;

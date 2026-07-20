@@ -89,35 +89,33 @@ class CDPClient:
         2. Find a page-type target (or the one matching target_id)
         3. Connect to its webSocketDebuggerUrl
         """
-        # Fetch target list
+        # Reuse one connection pool for target discovery and tab creation.
         async with httpx.AsyncClient(timeout=10.0) as http:
             resp = await http.get(f"{http_url}/json")
             if resp.status_code != 200:
                 raise CDPError("connect_to_target", resp.status_code, f"HTTP {resp.status_code}")
             targets = resp.json()
 
-        # Find the target
-        target = None
-        if target_id:
-            # When a specific target_id is requested, search exclusively for it.
-            # Don't fall back to "first page target" — that could match an
-            # unrelated tab.
-            for t in targets:
-                if t.get("id") == target_id:
-                    target = t
-                    break
-            if target is None:
-                raise CDPError("connect_to_target", -1,
-                               f"Target {target_id} not found in CDP target list")
-        else:
-            for t in targets:
-                if t.get("type") == "page":
-                    target = t
-                    break
+            # Find the target
+            target = None
+            if target_id:
+                # When a specific target_id is requested, search exclusively
+                # for it; do not attach to an unrelated first tab.
+                for t in targets:
+                    if t.get("id") == target_id:
+                        target = t
+                        break
+                if target is None:
+                    raise CDPError("connect_to_target", -1,
+                                   f"Target {target_id} not found in CDP target list")
+            else:
+                for t in targets:
+                    if t.get("type") == "page":
+                        target = t
+                        break
 
-        if target is None:
-            # Create a new tab if none exists
-            async with httpx.AsyncClient(timeout=10.0) as http:
+            if target is None:
+                # Create a new tab if none exists.
                 resp = await http.put(f"{http_url}/json/new")
                 if resp.status_code in (200, 201):
                     target = resp.json()

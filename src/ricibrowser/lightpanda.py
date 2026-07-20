@@ -147,9 +147,12 @@ class LightpandaEngine:
             await self._wait_for_selector(client, wait_for, timeout=self.timeout)
 
         # Extract content via isolated-world evaluation
-        title = await self._eval_isolated(client, "document.title", frame_id)
-        html = await self._eval_isolated(client, "document.documentElement.outerHTML", frame_id)
-        text_raw = await self._eval_isolated(client, "document.body ? document.body.innerText : ''", frame_id)
+        context_id = await self._create_isolated_context(client, frame_id)
+        title, html, text_raw = await asyncio.gather(
+            self._eval_in_context(client, "document.title", context_id),
+            self._eval_in_context(client, "document.documentElement.outerHTML", context_id),
+            self._eval_in_context(client, "document.body ? document.body.innerText : ''", context_id),
+        )
 
         title_str = str(title.get("result", {}).get("value", "")) if title else ""
         html_str = str(html.get("result", {}).get("value", "")) if html else ""
@@ -166,7 +169,8 @@ class LightpandaEngine:
         is_cf, cf_type = detect_cloudflare(html_str, title_str)
 
         # Truncate text
-        truncated_text, was_truncated = truncate(text_str, max_chars)
+        truncated_text, text_truncated = truncate(text_str, max_chars)
+        truncated_html, html_truncated = truncate(html_str, max(max_chars * 4, 20_000))
 
         # Get cookies
         cookies: list[dict] = []
@@ -179,13 +183,13 @@ class LightpandaEngine:
         return Page(
             url=url,
             final_url=url,  # Lightpanda doesn't expose final URL reliably
-            status_code=200,  # Lightpanda doesn't expose HTTP status via CDP
+            status_code=0,  # Unknown: Lightpanda does not expose response status here.
             title=title_str,
             text=truncated_text,
-            html=html_str,
+            html=truncated_html,
             links=links,
             cookies=cookies,
-            truncated=was_truncated,
+            truncated=text_truncated or html_truncated,
             cloudflare_challenge=is_cf,
             cloudflare_type=cf_type,
             screenshot_path=None,
@@ -252,11 +256,29 @@ class LightpandaEngine:
                         "contextId": context_id,
                         "returnByValue": True,
                     })
-            except CDPError:
-                pass  # Fall through to non-isolated eval
+            except CDPError as exc:
+                raise CDPError(
+                    "Runtime.evaluate", exc.code,
+                    "Isolated execution context unavailable",
+                ) from exc
+        raise CDPError("Runtime.evaluate", -1, "Missing frame for isolated evaluation")
 
-        # Fallback: evaluate without isolated world (if createIsolatedWorld not supported)
-        return await client.send("Runtime.evaluate", {
-            "expression": expression,
-            "returnByValue": True,
-        })
+    async def _create_isolated_context(self, client: CDPClient, frame_id: str) -> int | None:
+        if not frame_id:
+            return None
+        try:
+            result = await client.send("Page.createIsolatedWorld", {
+                "frameId": frame_id,
+                "worldName": "ricibrowser_eval",
+            })
+            return result.get("executionContextId")
+        except CDPError:
+            return None
+
+    async def _eval_in_context(
+        self, client: CDPClient, expression: str, context_id: int | None,
+    ) -> dict:
+        params: dict[str, Any] = {"expression": expression, "returnByValue": True}
+        if context_id is not None:
+            params["contextId"] = context_id
+        return await client.send("Runtime.evaluate", params)

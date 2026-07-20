@@ -32,11 +32,15 @@ class TestEvaluateBool:
         """evaluate_bool returns True when CDP returns Python True (str=True → 'True')."""
         from ricibrowser.cdp_client import CDPClient, CDPError
         client = MagicMock()
-        client.send = AsyncMock(return_value={"result": {"value": True}})
+        client.send = AsyncMock(side_effect=[
+            {"executionContextId": 1},
+            {"result": {"value": True}},
+        ])
         client._closed = False
         client._event_handlers = {}
         client._pending = {}
         session = Session(client)
+        session._frame_id = "frame-1"
         result = await session.evaluate_bool("1==1")
         assert result is True
 
@@ -44,11 +48,15 @@ class TestEvaluateBool:
     async def test_eval_false(self):
         from ricibrowser.cdp_client import CDPClient
         client = MagicMock()
-        client.send = AsyncMock(return_value={"result": {"value": False}})
+        client.send = AsyncMock(side_effect=[
+            {"executionContextId": 1},
+            {"result": {"value": False}},
+        ])
         client._closed = False
         client._event_handlers = {}
         client._pending = {}
         session = Session(client)
+        session._frame_id = "frame-1"
         result = await session.evaluate_bool("1==2")
         assert result is False
 
@@ -63,6 +71,50 @@ class TestEvaluateBool:
         session = Session(client)
         result = await session.evaluate_bool("nah")
         assert result is None
+
+    @pytest.mark.asyncio
+    async def test_stale_context_retries_once(self):
+        from ricibrowser.cdp_client import CDPError
+
+        client = MagicMock()
+        client.send = AsyncMock(side_effect=[
+            {"executionContextId": 1},
+            CDPError("Runtime.evaluate", -32000, "Cannot find context"),
+            {"executionContextId": 2},
+            {"result": {"value": "recovered"}},
+        ])
+        client._closed = False
+        client._event_handlers = {}
+        session = Session(client)
+        session._frame_id = "frame-1"
+
+        assert await session.evaluate("document.title") == "recovered"
+
+    @pytest.mark.asyncio
+    async def test_page_capture_uses_single_snapshot_evaluation(self):
+        client = MagicMock()
+        client.send = AsyncMock(side_effect=[
+            {"executionContextId": 1},
+            {"result": {"value": {
+                "title": "Example",
+                "html": "<html><body>Hello</body></html>",
+                "text": "Hello",
+                "url": "https://example.com/final",
+            }}},
+            {"cookies": []},
+        ])
+        client._closed = False
+        client._event_handlers = {}
+        session = Session(client)
+        session._frame_id = "frame-1"
+
+        page = await session._capture_page("https://example.com", max_chars=3)
+
+        assert page.final_url == "https://example.com/final"
+        assert page.text == "Hel…"
+        assert page.truncated is True
+        methods = [call.args[0] for call in client.send.await_args_list]
+        assert methods.count("Runtime.evaluate") == 1
 
 
 # ── Fingerprint ──────────────────────────────────────────────────────

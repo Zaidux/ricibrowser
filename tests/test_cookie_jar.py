@@ -1,6 +1,7 @@
 """Tests for cookie jar persistence."""
 
 import json
+import stat
 import os
 import tempfile
 
@@ -20,6 +21,7 @@ class TestCookieJar:
         try:
             jar.path = path
             jar.save()
+            assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
 
             jar2 = CookieJar(path)
             jar2.load()

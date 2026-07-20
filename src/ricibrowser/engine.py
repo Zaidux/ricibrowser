@@ -103,7 +103,7 @@ class Engine:
         # Fallback to CDP-Chrome
         return await self._browse_chrome(url, max_chars, **kwargs)
 
-    async def fast_browse_sync(self, url: str, **kwargs) -> Page:
+    def fast_browse_sync(self, url: str, **kwargs) -> Page:
         """Synchronous wrapper for fast_browse (for CLI use)."""
         return asyncio.run(self.fast_browse(url, **kwargs))
 
@@ -183,16 +183,16 @@ class Engine:
         # attempts failed" because Chrome hasn't started listening yet.
         debug_url = get_debug_url(self.config.chrome_debug_port)
         import httpx
-        for attempt in range(10):
-            await asyncio.sleep(0.5)
-            try:
-                async with httpx.AsyncClient(timeout=2.0) as http:
+        async with httpx.AsyncClient(timeout=2.0) as http:
+            for attempt in range(10):
+                await asyncio.sleep(0.5)
+                try:
                     resp = await http.get(f"{debug_url}/json/version")
                     if resp.status_code == 200:
                         logger.info("Chrome ready after %d polls", attempt + 1)
                         return debug_url
-            except Exception:
-                continue
+                except Exception:
+                    continue
         logger.warning("Chrome did not become ready after 5s — proceeding anyway")
         return debug_url
 
@@ -211,7 +211,11 @@ class Engine:
             if self._network.enabled:
                 await self._network.start(client)
 
-            page = await session.navigate(url, wait_until="networkidle" if self._network.enabled else "load")
+            page = await session.navigate(
+                url,
+                wait_until="networkidle" if self._network.enabled else "load",
+                max_chars=max_chars,
+            )
 
             # Save cookies back to jar
             cookies = await session.get_cookies()
