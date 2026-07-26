@@ -10,11 +10,13 @@ A :class:`Page` is the immutable result of a browse/navigate operation.
 
 from __future__ import annotations
 
+import asyncio as _aio
 import base64
 import json
 import logging
 import os
 import tempfile
+import time as _time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -105,16 +107,22 @@ class Session:
         Without this, the cached _isolated_context_id points at a destroyed
         execution context after a SPA navigation or link click, and
         evaluate() silently fails with a stale contextId error.
+
+        Also tracks redirect URLs so _capture_page() can report the real
+        final URL after an SSO redirect chain (e.g. ctf.hackthebox.com →
+        account.hackthebox.com/login → ctf.hackthebox.com/callback).
         """
         def _on_frame_navigated(params: dict) -> None:
-            # The main frame's id changes on navigation
-            new_frame_id = params.get("frame", {}).get("id", "")
+            frame = params.get("frame", {})
+            new_frame_id = frame.get("id", "")
+            new_url = frame.get("url", "")
             if new_frame_id and new_frame_id != self._frame_id:
                 self._frame_id = new_frame_id
-                self._isolated_context_id = None  # Force recreation
-                logger.debug("Frame navigated, isolated context invalidated")
+                self._isolated_context_id = None
+                if new_url:
+                    self._current_url = new_url
+                logger.debug("Frame navigated to %s, isolated context invalidated", new_url)
 
-        # Register the callback (sync — the CDPClient handles async dispatch)
         self._cdp._event_handlers.setdefault("Page.frameNavigated", []).append(_on_frame_navigated)
 
     async def _ensure_page_enabled(self) -> None:
@@ -164,13 +172,13 @@ class Session:
         url = validate_url(url)
         await self._ensure_page_enabled()
 
-        # Enable Network domain only if we want network-idle waiting
-        # or debug capture. Otherwise leave it off (detection vector).
-        if wait_until == "networkidle":
-            try:
-                await self._cdp.send("Network.enable")
-            except CDPError:
-                pass
+        # Enable Network domain — needed for cookie capture across redirects
+        # and for Network.getCookies to return cookies set during the redirect
+        # chain (SSO flows: Set-Cookie on 302 responses to intermediate domains).
+        try:
+            await self._cdp.send("Network.enable")
+        except CDPError:
+            pass
 
         result = await self._cdp.send("Page.navigate", {"url": url})
         self._frame_id = result.get("frameId", "")
@@ -182,6 +190,27 @@ class Session:
         # Wait for content
         from ricibrowser.wait import wait_for_content_stable
         await wait_for_content_stable(self._cdp, self._frame_id, mode=wait_until)
+
+        # ── URL stability: handle JS-based SSO redirects ────────────
+        # Some auth flows (OAuth, SAML, SSO) fire a JS redirect AFTER the
+        # initial page load completes (window.location, form auto-submit,
+        # meta-refresh). wait_for_content_stable finishes at readyState==complete
+        # on the intermediate page. We poll location.href to catch the final
+        # URL once the redirect settles.
+        last_url = ""
+        stability_timeout = getattr(self, "_url_stability_timeout", 8.0)
+        deadline = _time.monotonic() + stability_timeout
+        while _time.monotonic() < deadline:
+            try:
+                cur = await self.evaluate("location.href")
+                if cur and cur == last_url:
+                    if cur:
+                        self._current_url = cur
+                    break
+                last_url = cur or ""
+            except Exception:
+                pass
+            await _aio.sleep(0.5)
 
         return await self._capture_page(url, max_chars=max_chars)
 
@@ -245,33 +274,58 @@ class Session:
         return str(value) if value is not None else None
 
     async def evaluate_value(self, expression: str) -> Any:
-        """Evaluate in the isolated world and preserve JSON-compatible types."""
-        context_id = await self._get_or_create_isolated_world()
-        if context_id is None:
-            logger.warning("JS evaluation skipped: isolated context unavailable")
-            return None
+        """Evaluate in the isolated world and preserve JSON-compatible types.
+
+        Falls back to the default execution context when the isolated world is
+        unavailable — this can happen during redirects, before the first
+        navigation, or when ``Page.createIsolatedWorld`` is not supported by
+        the browser engine (Lightpanda).  Without this fallback,
+        ``_capture_page`` receives an empty ``{}`` snapshot and the page
+        appears blank.
+        """
+        context_id: int | None = None
+        try:
+            context_id = await self._get_or_create_isolated_world()
+        except Exception as exc:
+            logger.debug("Could not create isolated world (will use default context): %s", exc)
         params: dict[str, Any] = {
             "expression": expression,
             "returnByValue": True,
         }
-        params["contextId"] = context_id
+        if context_id is not None:
+            params["contextId"] = context_id
 
         try:
             result = await self._cdp.send("Runtime.evaluate", params)
             return result.get("result", {}).get("value")
         except CDPError as exc:
-            # If the contextId was stale (frame changed underneath us), reset
-            # and retry once with a fresh isolated world.
-            if "context" in exc.message.lower():
+            # If the contextId was stale (frame changed underneath us), try a
+            # fresh isolated world.  If that also fails, fall back to the
+            # default execution context — a blank page is worse than a
+            # detectable evaluation.
+            if "context" in exc.message.lower() and context_id is not None:
                 self._isolated_context_id = None
-                retry_context = await self._get_or_create_isolated_world()
+                try:
+                    retry_context = await self._get_or_create_isolated_world()
+                except Exception:
+                    retry_context = None
                 if retry_context is not None:
                     params["contextId"] = retry_context
-                    try:
-                        result = await self._cdp.send("Runtime.evaluate", params)
-                        return result.get("result", {}).get("value")
-                    except CDPError:
-                        pass
+                else:
+                    params.pop("contextId", None)
+                try:
+                    result = await self._cdp.send("Runtime.evaluate", params)
+                    return result.get("result", {}).get("value")
+                except CDPError:
+                    pass
+            elif context_id is not None:
+                # Non-context error: try without isolated context as fallback.
+                params.pop("contextId", None)
+                try:
+                    result = await self._cdp.send("Runtime.evaluate", params)
+                    return result.get("result", {}).get("value")
+                except CDPError:
+                    pass
             logger.warning("JS evaluation failed: %s", exc)
             return None
 
@@ -279,17 +333,15 @@ class Session:
         """Evaluate a JS expression that returns a boolean.
 
         Returns True/False, or None if evaluation failed or returned
-        a non-boolean value. Centralizes the str(bool) comparison so
-        callers don't need magic tuples.
+        a non-boolean value. Uses evaluate_value to preserve the native
+        Python bool type returned by CDP Runtime.evaluate (avoids the
+        string "true" vs Python bool True confusion).
         """
-        result = await self.evaluate(expression)
-        if result is None:
-            return None
-        # CDP returns Python bool → str(True) = "True"
-        if result in ("true", "True"):
-            return True
-        if result in ("false", "False"):
-            return False
+        value = await self.evaluate_value(expression)
+        if isinstance(value, bool):
+            return value
+        if value is True or value is False:
+            return value
         return None
 
     async def screenshot(self, path: str | None = None, full_page: bool = False) -> str:
@@ -320,9 +372,18 @@ class Session:
 
         return path
 
-    async def click(self, selector: str, timeout: float = 5.0) -> bool:
+    async def click(self, selector: str, timeout: float = 5.0, wait_for_navigation: bool = True) -> bool:
         """Click an element matching a CSS selector.
+
+        If *wait_for_navigation* is True (default), polls location.href after
+        the click to detect SSO/redirect chains and waits for URL stability.
         Returns True if the click succeeded."""
+        url_before = ""
+        if wait_for_navigation:
+            try:
+                url_before = await self.evaluate("location.href") or ""
+            except Exception:
+                pass
         selector_json = json.dumps(selector)
         js = f"""
         (function() {{
@@ -334,12 +395,14 @@ class Session:
         """
         result = await self.evaluate(js)
         # CDP returns Python bool → str(True) = "True", not "true"
-        return result in ("true", "True") or result is True
+        ok = result in ("true", "True") or result is True
+        if ok and wait_for_navigation and url_before:
+            await self._wait_for_url_stability(url_before)
+        return ok
 
     async def fill(self, selector: str, value: str, timeout: float = 5.0) -> bool:
         """Fill an input element with a value.
         Returns True if the fill succeeded."""
-        # Escape the value for JS string injection
         selector_json = json.dumps(selector)
         value_json = json.dumps(value)
         js = f"""
@@ -354,6 +417,35 @@ class Session:
         """
         result = await self.evaluate(js)
         return result in ("true", "True") or result is True
+
+    async def _wait_for_url_stability(self, url_before: str) -> None:
+        """Poll location.href until the URL stops changing or times out.
+
+        Used after click() to detect SSO/redirect chains triggered by form
+        submissions or link clicks. If the URL changed, waits for it to
+        stabilise (same URL on two consecutive polls, up to 8s default).
+        """
+        stability_timeout = getattr(self, "_url_stability_timeout", 8.0)
+        last_url = ""
+        deadline = _time.monotonic() + stability_timeout
+        polled_once = False
+        while _time.monotonic() < deadline:
+            try:
+                cur = await self.evaluate("location.href")
+                if cur is None:
+                    continue
+                polled_once = True
+                if cur == last_url:
+                    if cur and cur != url_before:
+                        logger.debug("URL stabilised after click: %s", cur)
+                        self._current_url = cur
+                    return
+                last_url = cur
+            except Exception:
+                if polled_once:
+                    return
+                pass
+            await _aio.sleep(0.5)
 
     async def get_dom(self) -> str:
         """Return the full rendered DOM HTML."""
@@ -376,5 +468,5 @@ class Session:
 
     async def close(self) -> None:
         """Close the session and its CDP connection."""
-        if self._cdp and not self._cdp._closed:
+        if self._cdp and not self._cdp.is_closed:
             await self._cdp.close()
