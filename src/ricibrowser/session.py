@@ -114,6 +114,13 @@ class Session:
         """
         def _on_frame_navigated(params: dict) -> None:
             frame = params.get("frame", {})
+            # Only track the TOP-LEVEL frame. A page with iframes fires
+            # Page.frameNavigated for each child frame too; adopting a child
+            # frame id here meant _get_or_create_isolated_world later ran
+            # against a subframe that could be torn down independently, giving
+            # the recurring "No frame for given id found" (-32602) errors.
+            if frame.get("parentId"):
+                return
             new_frame_id = frame.get("id", "")
             new_url = frame.get("url", "")
             if new_frame_id and new_frame_id != self._frame_id:
@@ -121,7 +128,7 @@ class Session:
                 self._isolated_context_id = None
                 if new_url:
                     self._current_url = new_url
-                logger.debug("Frame navigated to %s, isolated context invalidated", new_url)
+                logger.debug("Main frame navigated to %s, isolated context invalidated", new_url)
 
         self._cdp._event_handlers.setdefault("Page.frameNavigated", []).append(_on_frame_navigated)
 
@@ -134,26 +141,73 @@ class Session:
             except CDPError:
                 pass
 
+    async def _refresh_main_frame_id(self) -> str:
+        """Look up the current top-level frame id via Page.getFrameTree.
+
+        The cached ``self._frame_id`` (captured from Page.navigate) goes stale
+        when the page swaps its main frame — cross-origin navigations, some SSO
+        redirect chains, and provisional→committed frame transitions all mint a
+        new frame id. Using the stale id in Page.createIsolatedWorld yields
+        ``-32602: No frame for given id found``. We re-read the live tree and
+        cache the real root frame id.
+        """
+        try:
+            tree = await self._cdp.send("Page.getFrameTree")
+            frame = (tree.get("frameTree") or {}).get("frame") or {}
+            fid = frame.get("id", "")
+            if fid:
+                self._frame_id = fid
+                url = frame.get("url")
+                if url:
+                    self._current_url = url
+            return fid
+        except CDPError as exc:
+            logger.debug("Page.getFrameTree failed: %s", exc)
+            return ""
+
     async def _get_or_create_isolated_world(self) -> int | None:
         """Get or create an isolated execution context for JS evaluation.
 
         Per the CDP spec: Page.createIsolatedWorld creates a new isolated
         world for the given frame. We NEVER call Runtime.enable on the main
         context — all JS evaluation goes through isolated worlds.
+
+        If the cached frame id is stale (``No frame for given id found``), we
+        re-resolve the live main frame from Page.getFrameTree once and retry,
+        rather than logging a warning and returning None (which produced the
+        recurring "Could not create isolated world" spam and empty captures
+        while browsing sites that swap their main frame, e.g. login flows).
         """
         if self._isolated_context_id is not None:
             return self._isolated_context_id
         if not self._frame_id:
-            return None
-        try:
+            # No frame yet — try to discover the live one.
+            await self._refresh_main_frame_id()
+            if not self._frame_id:
+                return None
+
+        async def _create(frame_id: str) -> int | None:
             result = await self._cdp.send("Page.createIsolatedWorld", {
-                "frameId": self._frame_id,
+                "frameId": frame_id,
                 "worldName": "ricibrowser_isolated",
             })
-            self._isolated_context_id = result.get("executionContextId")
+            return result.get("executionContextId")
+
+        try:
+            self._isolated_context_id = await _create(self._frame_id)
             return self._isolated_context_id
         except CDPError as exc:
-            logger.warning("Could not create isolated world: %s", exc)
+            # Stale frame id: re-resolve the live main frame and retry once.
+            if "frame" in exc.message.lower():
+                fresh = await self._refresh_main_frame_id()
+                if fresh:
+                    try:
+                        self._isolated_context_id = await _create(fresh)
+                        return self._isolated_context_id
+                    except CDPError as exc2:
+                        logger.debug("Isolated world retry failed: %s", exc2)
+                        return None
+            logger.debug("Could not create isolated world: %s", exc)
             return None
 
     async def navigate(self, url: str, wait_until: str = "load", max_chars: int = 10_000) -> Page:

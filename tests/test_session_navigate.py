@@ -146,5 +146,58 @@ async def test_navigate_falls_back_when_load_event_never_fires():
     assert page.title == "late"
 
 
+@pytest.mark.asyncio
+async def test_isolated_world_recovers_from_stale_frame():
+    """A stale frame id (-32602 No frame for given id found) triggers a
+    Page.getFrameTree re-resolve + retry instead of failing."""
+    client = _make_client()
+    calls = {"createIsolatedWorld": 0}
+
+    async def fake_send(method, params=None):
+        if method == "Page.createIsolatedWorld":
+            calls["createIsolatedWorld"] += 1
+            fid = (params or {}).get("frameId")
+            if fid == "STALE":
+                from ricibrowser.cdp_client import CDPError
+                raise CDPError("Page.createIsolatedWorld", -32602, "No frame for given id found")
+            return {"executionContextId": 99}
+        if method == "Page.getFrameTree":
+            return {"frameTree": {"frame": {"id": "FRESH", "url": "http://t/"}}}
+        return {}
+
+    client.send = AsyncMock(side_effect=fake_send)
+
+    session = Session(client, "cdp_chrome")
+    session._frame_id = "STALE"
+
+    ctx = await session._get_or_create_isolated_world()
+    assert ctx == 99
+    assert session._frame_id == "FRESH"
+    assert calls["createIsolatedWorld"] == 2  # first stale, then retry on fresh
+
+
+@pytest.mark.asyncio
+async def test_frame_listener_ignores_subframes():
+    """Page.frameNavigated for a child (iframe) must not hijack the main
+    frame id — that was the source of the recurring -32602 while browsing
+    pages with iframes."""
+    client = _make_client()
+    client.send = AsyncMock(return_value={})
+    session = Session(client, "cdp_chrome")
+    session._frame_id = "MAIN"
+    session._isolated_context_id = 5
+
+    handler = client._event_handlers["Page.frameNavigated"][0]
+    # A subframe navigation (has parentId) must be ignored.
+    handler({"frame": {"id": "CHILD", "parentId": "MAIN", "url": "http://ads/"}})
+    assert session._frame_id == "MAIN"
+    assert session._isolated_context_id == 5
+
+    # A real top-level navigation (no parentId) updates + invalidates.
+    handler({"frame": {"id": "MAIN2", "url": "http://t/next"}})
+    assert session._frame_id == "MAIN2"
+    assert session._isolated_context_id is None
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
