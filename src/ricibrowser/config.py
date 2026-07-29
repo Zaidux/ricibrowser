@@ -66,6 +66,12 @@ class EngineConfig:
     """Use human-like mouse movement (bezier curves + timing) for clicks."""
     header_consistency: bool = False
     """Ensure Sec-CH-UA and request headers match a real Chrome release."""
+    url_stability_timeout: float = 8.0
+    """Max seconds to poll location.href after page load for JS-based SSO redirects."""
+    nav_timeout: float = 30.0
+    """Max seconds to wait for the Page.loadEventFired signal after Page.navigate."""
+    chrome_startup_timeout: float = 20.0
+    """Max seconds to wait for Chrome's CDP endpoint to become reachable after launch."""
 
     def __post_init__(self) -> None:
         if isinstance(self.fast_engine, str):

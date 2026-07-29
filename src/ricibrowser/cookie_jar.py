@@ -10,9 +10,15 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+def _norm_domain(domain: str) -> str:
+    """Normalize a cookie domain: strip leading dot for dedup keys."""
+    return domain.lstrip(".") if domain else ""
 
 
 class CookieJar:
@@ -47,6 +53,7 @@ class CookieJar:
                 self._data["cookies"] = []
             if "storage" not in self._data:
                 self._data["storage"] = {}
+            self._gc()
         except Exception as exc:
             logger.warning("CookieJar load failed: %s", exc)
             self._data = {"cookies": [], "storage": {}}
@@ -55,10 +62,9 @@ class CookieJar:
         """Save the jar to disk (atomic write with unique temp file)."""
         if not self.path:
             return
+        self._gc()
         dir_path = os.path.dirname(self.path) or "."
         os.makedirs(dir_path, exist_ok=True)
-        # Use NamedTemporaryFile for a unique temp name (avoids concurrent-write
-        # collision on the same .tmp path).
         import tempfile
         fd, tmp = tempfile.mkstemp(dir=dir_path, suffix=".tmp")
         try:
@@ -70,6 +76,25 @@ class CookieJar:
             os.unlink(tmp)
             raise
 
+    def _gc(self) -> None:
+        """Remove expired cookies. Runs on load and before save."""
+        now = time.time()
+        cookies = self._data.get("cookies", [])
+        if not cookies:
+            return
+        alive = []
+        purged = 0
+        for c in cookies:
+            expires = c.get("expires")
+            if expires and isinstance(expires, (int, float)) and expires > 0:
+                if expires < now:
+                    purged += 1
+                    continue
+            alive.append(c)
+        if purged:
+            self._data["cookies"] = alive
+            logger.debug("CookieJar GC: purged %d expired, %d remain", purged, len(alive))
+
     @property
     def cookies(self) -> list[dict]:
         return self._data.get("cookies", [])
@@ -79,10 +104,15 @@ class CookieJar:
         self._data["cookies"] = cookies
 
     def update_cookies(self, cookies: list[dict]) -> None:
-        """Merge new cookies (by name + domain)."""
-        existing = {(c.get("name"), c.get("domain")): c for c in self.cookies}
+        """Merge new cookies by (name, normalized_domain).
+
+        Normalizes leading-dot domains so ``.example.com`` and ``example.com``
+        are treated as the same logical cookie (per RFC 6265, the leading dot
+        denotes a domain cookie matching all subdomains).
+        """
+        existing = {(_norm_domain(c.get("domain", "")), c.get("name")): c for c in self.cookies}
         for c in cookies:
-            key = (c.get("name"), c.get("domain"))
+            key = (_norm_domain(c.get("domain", "")), c.get("name"))
             existing[key] = c
         self._data["cookies"] = list(existing.values())
 
@@ -95,13 +125,11 @@ class CookieJar:
         result = []
         for c in self.cookies:
             cdomain = c.get("domain", "")
-            if cdomain == domain:
+            if _norm_domain(cdomain) == domain:
                 result.append(c)
             elif cdomain.startswith("."):
-                # Dot domain: must be a suffix at a dot boundary
-                bare = cdomain[1:]  # "example.com"
+                bare = cdomain[1:]
                 if domain == bare or domain.endswith(cdomain):
-                    # domain.endswith(".example.com") ensures boundary
                     result.append(c)
         return result
 

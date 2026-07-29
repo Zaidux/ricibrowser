@@ -77,7 +77,7 @@ _CANVAS_NOISE_JS = """
                 // Apply noised data to the temp canvas only
                 tmpCtx.putImageData(imageData, 0, 0);
                 // Return the noised temp canvas's data URL
-                return _origToDataURL.call(tmp, arguments);
+                return _origToDataURL.apply(tmp, arguments);
             }} catch(e) {{}}  // CORS-restricted canvases skip
         }}
         return _origToDataURL.apply(this, arguments);

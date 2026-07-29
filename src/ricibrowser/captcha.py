@@ -28,6 +28,7 @@ Usage::
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from dataclasses import dataclass
@@ -364,9 +365,9 @@ class CaptchaHandler:
                 if token:
                     # Inject the token into the page
                     await session.evaluate(
-                        f"document.getElementById('g-recaptcha-response').value = '{token}';"
+                        f"document.getElementById('g-recaptcha-response').value = {json.dumps(token)};"
                         if captcha_type == CaptchaType.RECAPTCHA_V2 else
-                        f"window.__captcha_token__ = '{token}';"
+                        f"window.__captcha_token__ = {json.dumps(token)};"
                     )
                     return CaptchaResult(
                         captcha_type=captcha_type,

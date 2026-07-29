@@ -58,7 +58,14 @@ async def wait_for_content_stable(
 
 
 async def _wait_ready_state(cdp: CDPClient, target: str, timeout: float) -> None:
-    """Poll document.readyState until it reaches the target state."""
+    """Poll document.readyState until it reaches the target state.
+
+    Note: callers in :mod:`ricibrowser.session` now await the real
+    ``Page.loadEventFired`` signal *before* invoking this, so by the time we
+    poll, ``readyState`` belongs to the committed target document — not the
+    stale about:blank / previous page that used to answer 'complete'
+    immediately and cause blank captures.
+    """
     deadline = time.monotonic() + timeout
     expr = "document.readyState"
     while time.monotonic() < deadline:
@@ -74,7 +81,7 @@ async def _wait_ready_state(cdp: CDPClient, target: str, timeout: float) -> None
                 return
         except CDPError:
             pass
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(0.1)
     logger.debug("wait_for_ready_state timeout after %.1fs", timeout)
 
 
@@ -111,27 +118,54 @@ async def _wait_dom_stable(cdp: CDPClient, timeout: float = 10.0) -> None:
 
 
 async def _wait_network_idle(cdp: CDPClient, timeout: float = 5.0) -> None:
-    """Best-effort network-idle check.
+    """Best-effort network-idle check using Network domain CDP API.
 
-    Polls for outstanding network requests via CDP. If the Network domain
-    isn't enabled (the normal case — Network.enable is a detection vector),
-    this is a no-op and returns immediately. This is intentionally best-effort
-    since true network idle tracking requires the Network domain.
+    Since session.py now enables Network.enable by default (required for
+    SSO redirect cookie capture), we can check for inflight network requests
+    via a JS counter that tracks XMLHttpRequest and fetch() in progress.
     """
-    # Check if there are pending requests by evaluating a simple JS counter.
-    # If Network domain isn't enabled, this just falls back to a short delay.
+    _NET_IDLE_JS = """
+    (function() {
+        if (window.__ricibrowser_net_idle_active === true) return (window.__ricibrowser_net_outstanding || 0);
+        window.__ricibrowser_net_idle_active = true;
+        window.__ricibrowser_net_outstanding = 0;
+        var _origFetch = window.fetch;
+        window.fetch = function() {
+            window.__ricibrowser_net_outstanding++;
+            var p = _origFetch.apply(this, arguments);
+            p.finally(function() { window.__ricibrowser_net_outstanding--; });
+            return p;
+        };
+        var _origXHROpen = XMLHttpRequest.prototype.open;
+        XMLHttpRequest.prototype.open = function() {
+            this.addEventListener('loadend', function() { window.__ricibrowser_net_outstanding--; });
+            window.__ricibrowser_net_outstanding++;
+            return _origXHROpen.apply(this, arguments);
+        };
+        return 0;
+    })()
+    """
     import time
     deadline = time.monotonic() + timeout
+
+    # Inject the counter on first call (idempotent)
+    try:
+        await cdp.send("Runtime.evaluate", {
+            "expression": _NET_IDLE_JS,
+            "returnByValue": True,
+        })
+    except CDPError:
+        return
+
     while time.monotonic() < deadline:
         try:
             result = await cdp.send("Runtime.evaluate", {
-                "expression": "window.__ricibrowser_outstanding || 0",
+                "expression": "window.__ricibrowser_net_outstanding || 0",
                 "returnByValue": True,
             })
             value = result.get("result", {}).get("value", 0)
             if not value or int(value) == 0:
                 return
         except CDPError:
-            # If this fails, Network domain likely isn't enabled — just return.
             return
         await asyncio.sleep(0.3)

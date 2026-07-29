@@ -180,14 +180,68 @@ class Session:
         except CDPError:
             pass
 
-        result = await self._cdp.send("Page.navigate", {"url": url})
-        self._frame_id = result.get("frameId", "")
-        self._current_url = url
+        # ── Robust navigation gating (fixes flaky / empty page loads) ──
+        # The previous implementation sent Page.navigate then immediately polled
+        # document.readyState. That races the *old* document: a freshly-created
+        # tab (about:blank) or a prior fully-loaded page answers readyState
+        # 'complete' before Chrome commits the new navigation, so we captured a
+        # blank/stale page. We now register a load-event waiter BEFORE issuing
+        # Page.navigate, so the event can't fire in the gap between the command
+        # and the subscription, then await the real load signal.
+        nav_timeout = getattr(self, "_nav_timeout", 30.0)
+        loop = _aio.get_event_loop()
+        load_future: "_aio.Future[dict]" = loop.create_future()
+        expected_frame: dict[str, str] = {"id": ""}
 
-        # Reset the isolated world (frame changed)
-        self._isolated_context_id = None
+        def _on_load(params: dict) -> None:
+            if not load_future.done():
+                load_future.set_result(params)
 
-        # Wait for content
+        def _on_frame_stopped(params: dict) -> None:
+            fid = params.get("frameId", "")
+            if not load_future.done() and (not expected_frame["id"] or fid == expected_frame["id"]):
+                load_future.set_result(params)
+
+        self._cdp._event_handlers.setdefault("Page.loadEventFired", []).append(_on_load)
+        self._cdp._event_handlers.setdefault("Page.frameStoppedLoading", []).append(_on_frame_stopped)
+
+        try:
+            result = await self._cdp.send("Page.navigate", {"url": url})
+            # Page.navigate reports hard navigation failures via errorText
+            # (net::ERR_NAME_NOT_RESOLVED, ERR_CONNECTION_REFUSED, etc.). A
+            # blank page from a failed load is a real error, not a slow render.
+            error_text = result.get("errorText")
+            self._frame_id = result.get("frameId", "")
+            expected_frame["id"] = self._frame_id
+            self._current_url = url
+
+            # Reset the isolated world (frame changed)
+            self._isolated_context_id = None
+
+            if error_text and error_text not in ("net::ERR_ABORTED",):
+                # ERR_ABORTED is benign (e.g. a download or a client redirect
+                # superseding the navigation); anything else is a real failure.
+                logger.warning("Navigation to %s failed: %s", url, error_text)
+                page = await self._capture_page(url, max_chars=max_chars)
+                page.status_code = 0
+                return page
+
+            # Wait for the real load event (bounded). This replaces racing
+            # readyState against a stale document.
+            try:
+                await _aio.wait_for(load_future, timeout=nav_timeout)
+            except _aio.TimeoutError:
+                logger.debug("load event not observed within %.1fs; falling back to poll", nav_timeout)
+        finally:
+            for name, cb in (("Page.loadEventFired", _on_load),
+                             ("Page.frameStoppedLoading", _on_frame_stopped)):
+                handlers = self._cdp._event_handlers.get(name)
+                if handlers and cb in handlers:
+                    handlers.remove(cb)
+
+        # Supplementary content-stability wait (DOM settle for SPAs). This now
+        # runs AFTER the new document has actually committed + loaded, so the
+        # readyState it polls belongs to the target page, not the old one.
         from ricibrowser.wait import wait_for_content_stable
         await wait_for_content_stable(self._cdp, self._frame_id, mode=wait_until)
 

@@ -119,18 +119,27 @@ class Engine:
         return await self._create_chrome_session()
 
     async def close(self) -> None:
-        """Stop all browser processes."""
+        """Stop all browser processes. Each stop is independent — failure
+        in one path doesn't prevent cleanup of the other."""
         if self._lightpanda:
-            await self._lightpanda.stop()
-            self._lightpanda = None
+            try:
+                await self._lightpanda.stop()
+            except Exception as exc:
+                logger.warning("Lightpanda stop failed: %s", exc)
+            finally:
+                self._lightpanda = None
         if self._chrome_proc:
-            stop_chrome(self._chrome_proc)
-            self._chrome_proc = None
+            try:
+                stop_chrome(self._chrome_proc)
+            except Exception as exc:
+                logger.warning("Chrome stop failed: %s", exc)
+            finally:
+                self._chrome_proc = None
 
     # ── Lightpanda path ────────────────────────────────────────────
 
     async def _get_lightpanda(self) -> LightpandaEngine:
-        if self._lightpanda is None or not self._lightpanda._started:
+        if self._lightpanda is None or not self._lightpanda.is_started:
             self._lightpanda = LightpandaEngine(
                 ws_url=self.config.lightpanda_url,
                 timeout=self.config.timeout,
@@ -144,7 +153,7 @@ class Engine:
             logger.info("Lightpanda not available, will use Chrome")
             return None
         lp = await self._get_lightpanda()
-        return await lp.browse(url, max_chars=max_chars, **kwargs)
+        return await lp.browse(url, max_chars=max_chars, cookies=self._cookie_jar.cookies or None, **kwargs)
 
     async def _create_lightpanda_session(self) -> Session:
         """Create a session via Lightpanda (limited — no screenshots)."""
@@ -153,6 +162,14 @@ class Engine:
         if client is None:
             raise RuntimeError("Lightpanda client not initialized")
         session = Session(client, engine_name="lightpanda")
+        session._url_stability_timeout = self.config.url_stability_timeout
+        session._nav_timeout = self.config.nav_timeout
+        # Preload cookies from jar (same as Chrome path)
+        if self._cookie_jar.cookies:
+            try:
+                await session.set_cookies(self._cookie_jar.cookies)
+            except Exception:
+                pass
         return session
 
     # ── CDP-Chrome path ────────────────────────────────────────────
@@ -161,11 +178,36 @@ class Engine:
         """Ensure Chrome is running and return its debug URL.
 
         Launches Chrome if needed, then polls until the CDP HTTP endpoint is
-        reachable (Chrome takes ~1-2s to start listening). This fixes the
-        "All connection attempts failed" error when Chrome is slow to start.
+        reachable (Chrome takes ~1-2s to start listening). Also detects
+        zombie/hung Chrome processes — reuses existing process ONLY if it
+        responds to a health check.
+
+        This fixes the "All connection attempts failed" error when Chrome
+        is slow to start, and the silent hang when Chrome is alive but
+        unresponsive.
         """
+        debug_url = get_debug_url(self.config.chrome_debug_port)
+
+        # If Chrome process exists and hasn't exited, verify it's responsive
         if self._chrome_proc and self._chrome_proc.poll() is None:
-            return get_debug_url(self.config.chrome_debug_port)
+            import httpx
+            try:
+                async with httpx.AsyncClient(timeout=2.0) as http:
+                    resp = await http.get(f"{debug_url}/json/version")
+                    if resp.status_code == 200:
+                        return debug_url
+            except Exception:
+                logger.warning("Chrome process alive but not responding — restarting")
+                stop_chrome(self._chrome_proc)
+            self._chrome_proc = None
+
+        # If old Chrome exited (zombie), clean up
+        if self._chrome_proc is not None:
+            try:
+                self._chrome_proc.wait(timeout=0.1)
+            except Exception:
+                pass
+            self._chrome_proc = None
 
         self._chrome_proc = launch_chrome(
             port=self.config.chrome_debug_port,
@@ -178,22 +220,36 @@ class Engine:
             user_agent=self.config.user_agent,
         )
 
-        # Poll until Chrome's CDP endpoint is reachable (Chrome takes ~1-2s).
-        # Without this, a fast connect_to_target fails with "All connection
-        # attempts failed" because Chrome hasn't started listening yet.
-        debug_url = get_debug_url(self.config.chrome_debug_port)
         import httpx
         async with httpx.AsyncClient(timeout=2.0) as http:
-            for attempt in range(10):
-                await asyncio.sleep(0.5)
+            # Chrome cold-starts can take several seconds (first launch, cold
+            # disk cache, container CPU contention). Polling only ~5s and then
+            # "proceeding anyway" caused the flaky "connects but page loads are
+            # empty" symptom: connect_to_target would race a not-yet-ready
+            # browser. Wait up to config.chrome_startup_timeout (default 20s).
+            startup_timeout = getattr(self.config, "chrome_startup_timeout", 20.0)
+            poll_interval = 0.25
+            polls = max(1, int(startup_timeout / poll_interval))
+            for attempt in range(polls):
+                # Bail early if Chrome died on launch (bad flag, missing lib).
+                if self._chrome_proc is not None and self._chrome_proc.poll() is not None:
+                    raise RuntimeError(
+                        f"Chrome exited during startup (code "
+                        f"{self._chrome_proc.returncode}). Check Chrome flags / "
+                        f"install. Try headless=new with --no-sandbox."
+                    )
                 try:
                     resp = await http.get(f"{debug_url}/json/version")
                     if resp.status_code == 200:
-                        logger.info("Chrome ready after %d polls", attempt + 1)
+                        logger.info("Chrome ready after %.1fs", (attempt + 1) * poll_interval)
                         return debug_url
                 except Exception:
-                    continue
-        logger.warning("Chrome did not become ready after 5s — proceeding anyway")
+                    pass
+                await asyncio.sleep(poll_interval)
+        logger.warning(
+            "Chrome did not become ready after %.0fs — proceeding anyway",
+            startup_timeout,
+        )
         return debug_url
 
     async def _browse_chrome(self, url: str, max_chars: int, **kwargs) -> Page:
@@ -202,6 +258,8 @@ class Engine:
         client = await CDPClient.connect_to_target(debug_url)
         try:
             session = Session(client, engine_name="cdp_chrome")
+            session._url_stability_timeout = self.config.url_stability_timeout
+            session._nav_timeout = self.config.nav_timeout
 
             # Load cookies from jar
             if self._cookie_jar.cookies:
@@ -234,6 +292,8 @@ class Engine:
         debug_url = await self._ensure_chrome()
         client = await CDPClient.connect_to_target(debug_url)
         session = Session(client, engine_name="cdp_chrome")
+        session._url_stability_timeout = self.config.url_stability_timeout
+        session._nav_timeout = self.config.nav_timeout
 
         # Load cookies from jar
         if self._cookie_jar.cookies:

@@ -34,5 +34,5 @@ from ricibrowser.config import EngineConfig, EngineType
 from ricibrowser.engine import Engine
 from ricibrowser.session import Page, Session
 
-__version__ = "0.2.0"
+__version__ = "0.2.10"
 __all__ = ["Engine", "EngineConfig", "EngineType", "Page", "Session"]

@@ -54,6 +54,10 @@ class LightpandaEngine:
         self._started = False
         self._target_id: str = ""  # created in start()
 
+    @property
+    def is_started(self) -> bool:
+        return self._started and self._client is not None and not self._client.is_closed
+
     @staticmethod
     async def is_available(ws_url: str = "ws://127.0.0.1:9222") -> bool:
         """Check if a Lightpanda instance is reachable at the given URL.
@@ -108,7 +112,7 @@ class LightpandaEngine:
 
     async def stop(self) -> None:
         """Disconnect from Lightpanda."""
-        if self._client and not self._client._closed:
+        if self._client and not self._client.is_closed:
             await self._client.close()
         self._client = None
         self._started = False
@@ -118,12 +122,17 @@ class LightpandaEngine:
         url: str,
         max_chars: int = 6000,
         wait_for: str | None = None,
+        cookies: list[dict] | None = None,
     ) -> Page:
         """Browse a URL via Lightpanda and return a Page with content.
 
         This is the fast path — no screenshots available (Lightpanda has no
         rendering engine). If a screenshot is needed, the caller should fall
         back to CDPChromeEngine.
+
+        Args:
+            cookies: Optional preloaded cookies to set before navigation
+                     (for SSO session persistence across redirects).
         """
         url = validate_url(url)
         client = self._ensure_client()
@@ -133,6 +142,21 @@ class LightpandaEngine:
             await client.send("Page.enable")
         except CDPError:
             pass  # Some CDP servers auto-enable Page
+
+        # Enable Network domain for cookie operations
+        try:
+            await client.send("Network.enable")
+        except CDPError:
+            pass
+
+        # Preload cookies before navigation — essential for SSO flows where
+        # the cookie jar holds session cookies for auth domains.
+        if cookies:
+            try:
+                await client.send("Network.setCookies", {"cookies": cookies})
+                logger.debug("Lightpanda: preloaded %d cookies", len(cookies))
+            except CDPError as exc:
+                logger.warning("Lightpanda set_cookies failed: %s", exc)
 
         # Navigate
         nav_result = await client.send("Page.navigate", {"url": url})
@@ -197,7 +221,7 @@ class LightpandaEngine:
         )
 
     def _ensure_client(self) -> CDPClient:
-        if not self._client or self._client._closed:
+        if not self._client or self._client.is_closed:
             raise RuntimeError("Lightpanda engine not started. Call start() first.")
         return self._client
 

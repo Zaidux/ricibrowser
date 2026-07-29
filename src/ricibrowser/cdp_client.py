@@ -65,6 +65,11 @@ class CDPClient:
         self._recv_task: asyncio.Task | None = None
         self._closed = False
 
+    @property
+    def is_closed(self) -> bool:
+        """Whether the CDP WebSocket connection is closed."""
+        return self._closed
+
     @classmethod
     async def connect(cls, ws_url: str) -> "CDPClient":
         """Connect directly to a CDP WebSocket endpoint.
@@ -151,7 +156,7 @@ class CDPClient:
         if params:
             msg["params"] = params
 
-        future: asyncio.Future[dict] = asyncio.get_event_loop().create_future()
+        future: asyncio.Future[dict] = asyncio.get_running_loop().create_future()
         self._pending[msg_id] = future
 
         try:
@@ -173,6 +178,50 @@ class CDPClient:
         Callbacks can be sync or async. Multiple callbacks per event are supported.
         """
         self._event_handlers.setdefault(event_name, []).append(callback)
+
+    async def wait_for_event(
+        self,
+        event_name: str,
+        predicate: Callable[[dict[str, Any]], bool] | None = None,
+        timeout: float = 30.0,
+    ) -> dict[str, Any] | None:
+        """Await the next occurrence of a CDP event.
+
+        Registers a temporary handler that resolves a future when *event_name*
+        fires (optionally filtered by *predicate*). Returns the event params, or
+        ``None`` on timeout. The handler is always removed on exit.
+
+        IMPORTANT: to avoid a race where the event fires between issuing a
+        command and subscribing, register this waiter *before* sending the
+        command that triggers the event (e.g. call this, get the awaitable,
+        then send ``Page.navigate``).
+        """
+        if self._closed:
+            return None
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[dict] = loop.create_future()
+
+        def _handler(params: dict[str, Any]) -> None:
+            if future.done():
+                return
+            try:
+                if predicate is None or predicate(params):
+                    future.set_result(params)
+            except Exception:
+                # A bad predicate must not wedge the recv loop.
+                if not future.done():
+                    future.set_result(params)
+
+        self._event_handlers.setdefault(event_name, []).append(_handler)
+        try:
+            return await asyncio.wait_for(future, timeout=timeout)
+        except asyncio.TimeoutError:
+            return None
+        finally:
+            handlers = self._event_handlers.get(event_name)
+            if handlers and _handler in handlers:
+                handlers.remove(_handler)
+
 
     async def _recv_loop(self) -> None:
         """Background task that reads WebSocket messages and dispatches them."""

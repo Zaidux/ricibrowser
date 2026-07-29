@@ -25,7 +25,8 @@ def validate_url(url: str) -> str:
         raise ValueError(f"URL must use http or https scheme (got: {parsed.scheme or 'none'})")
     if not parsed.netloc:
         raise ValueError("URL must have a host (e.g. https://example.com)")
-    return url
+    # Strip fragment and rebuild
+    return parsed._replace(fragment="").geturl()
 
 
 def strip_html(html: str) -> str:

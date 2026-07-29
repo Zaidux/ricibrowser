@@ -119,7 +119,10 @@ def launch_chrome(
         os.makedirs(user_data_dir, exist_ok=True)
         args.append(f"--user-data-dir={user_data_dir}")
 
-    # Disable GPU (headless environments often don't have GPU)
+    # Disable GPU. In headless containers there is usually no GPU; leaving GPU
+    # enabled makes Chrome try (and fail) to init a GL context, which manifests
+    # as flaky/aborted renders and occasional blank pages. --disable-gpu forces
+    # the software rasterizer, which is deterministic in headless environments.
     if headless:
         args.append("--disable-gpu")
 
