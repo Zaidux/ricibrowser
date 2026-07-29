@@ -296,8 +296,22 @@ class Session:
         # Supplementary content-stability wait (DOM settle for SPAs). This now
         # runs AFTER the new document has actually committed + loaded, so the
         # readyState it polls belongs to the target page, not the old one.
-        from ricibrowser.wait import wait_for_content_stable
-        await wait_for_content_stable(self._cdp, self._frame_id, mode=wait_until)
+        # For plain "load" mode we already awaited the real Page.loadEventFired
+        # above, so document.readyState is already "complete" — skip the
+        # redundant readyState re-poll (saves a Runtime.evaluate round-trip per
+        # navigation). DOM-stability / networkidle modes still run in full.
+        from ricibrowser.wait import wait_for_content_stable, _wait_dom_stable, _wait_network_idle
+        if wait_until == "load":
+            pass  # load event already observed
+        elif wait_until == "domcontentloaded":
+            pass  # load event implies interactive
+        elif wait_until == "domstable":
+            await _wait_dom_stable(self._cdp, timeout=10.0)
+        elif wait_until == "networkidle":
+            await _wait_dom_stable(self._cdp, timeout=10.0)
+            await _wait_network_idle(self._cdp, timeout=5.0)
+        else:
+            await wait_for_content_stable(self._cdp, self._frame_id, mode=wait_until)
 
         # ── URL stability: handle JS-based SSO redirects ────────────
         # Some auth flows (OAuth, SAML, SSO) fire a JS redirect AFTER the
@@ -305,25 +319,49 @@ class Session:
         # meta-refresh). wait_for_content_stable finishes at readyState==complete
         # on the intermediate page. We poll location.href to catch the final
         # URL once the redirect settles.
+        #
+        # Fast path: most navigations do NOT redirect post-load. We take one
+        # immediate reading, and only enter the polling loop if the URL differs
+        # from the requested URL (a redirect actually happened). This removes
+        # the fixed ~1s two-poll tax that every navigation used to pay.
         last_url = ""
         stability_timeout = getattr(self, "_url_stability_timeout", 8.0)
-        deadline = _time.monotonic() + stability_timeout
-        while _time.monotonic() < deadline:
-            try:
-                cur = await self.evaluate("location.href")
-                if cur and cur == last_url:
-                    if cur:
+        try:
+            first = await self.evaluate("location.href")
+        except Exception:
+            first = None
+        if first:
+            self._current_url = first
+        # Only poll for redirect settling if the landing URL diverged from the
+        # requested one (ignoring a trailing-slash / fragment difference).
+        def _norm(u: str) -> str:
+            return (u or "").split("#", 1)[0].rstrip("/")
+
+        if first and _norm(first) != _norm(url) and stability_timeout > 0:
+            last_url = first
+            deadline = _time.monotonic() + stability_timeout
+            while _time.monotonic() < deadline:
+                await _aio.sleep(0.25)
+                try:
+                    cur = await self.evaluate("location.href")
+                    if cur and cur == last_url:
                         self._current_url = cur
-                    break
-                last_url = cur or ""
-            except Exception:
-                pass
-            await _aio.sleep(0.5)
+                        break
+                    last_url = cur or last_url
+                except Exception:
+                    pass
 
-        return await self._capture_page(url, max_chars=max_chars)
+        return await self._capture_page(url, max_chars=max_chars, known_final_url=first or None)
 
-    async def _capture_page(self, url: str, max_chars: int = 10_000) -> Page:
-        """Capture the current page state into a Page object."""
+    async def _capture_page(self, url: str, max_chars: int = 10_000,
+                            known_final_url: str | None = None) -> Page:
+        """Capture the current page state into a Page object.
+
+        A single Runtime.evaluate returns title/html/text/url together so the
+        capture costs ONE CDP round-trip rather than four. ``known_final_url``
+        lets the caller skip re-reading location.href when it already polled it
+        during URL-stability settling.
+        """
         snapshot = await self.evaluate_value("""({
             title: document.title || '',
             html: document.documentElement ? document.documentElement.outerHTML : '',
@@ -334,7 +372,7 @@ class Session:
         title = str(snapshot.get("title", ""))
         html = str(snapshot.get("html", ""))
         text = str(snapshot.get("text", ""))
-        final_url = str(snapshot.get("url", "") or self._current_url)
+        final_url = str(snapshot.get("url", "") or known_final_url or self._current_url)
 
         if not text and html:
             text = strip_html(html)
