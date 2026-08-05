@@ -518,51 +518,231 @@ class Session:
 
         return path
 
-    async def click(self, selector: str, timeout: float = 5.0, wait_for_navigation: bool = True) -> bool:
-        """Click an element matching a CSS selector.
+    # ── Element resolution ────────────────────────────────────────────
+    #
+    # Injected into every element-targeting evaluation. Resolves a target
+    # string against the DOM using progressively looser strategies, because
+    # component frameworks routinely render inputs with no stable CSS hook —
+    # no name, no semantic id, just a label sitting next to a nested <input>.
+    #
+    # Order matters: exact CSS first so an explicit selector always wins and
+    # callers keep full control; the heuristics only run once CSS finds
+    # nothing. Shadow roots are pierced because CSS selectors cannot cross
+    # that boundary.
+    _RESOLVER_JS = """
+    function __rb_resolve(target) {
+        function deepQuery(root, sel) {
+            try {
+                var hit = root.querySelector(sel);
+                if (hit) return hit;
+            } catch (e) { return null; }
+            var walker = root.querySelectorAll('*');
+            for (var i = 0; i < walker.length; i++) {
+                if (walker[i].shadowRoot) {
+                    var deep = deepQuery(walker[i].shadowRoot, sel);
+                    if (deep) return deep;
+                }
+            }
+            return null;
+        }
 
-        If *wait_for_navigation* is True (default), polls location.href after
-        the click to detect SSO/redirect chains and waits for URL stability.
-        Returns True if the click succeeded."""
+        // 1. Treat it as a CSS selector (including inside shadow roots).
+        var el = deepQuery(document, target);
+        if (el) return el;
+
+        var needle = String(target).trim().toLowerCase();
+        var fields = Array.prototype.slice.call(
+            document.querySelectorAll('input, textarea, select, [contenteditable="true"]')
+        );
+        var visible = function (node) {
+            if (!node) return false;
+            var r = node.getBoundingClientRect();
+            if (!r.width && !r.height) return false;
+            var s = window.getComputedStyle(node);
+            return s.visibility !== 'hidden' && s.display !== 'none';
+        };
+        var match = function (text) {
+            if (!text) return false;
+            text = String(text).trim().toLowerCase();
+            return text === needle || (needle.length > 2 && text.indexOf(needle) !== -1);
+        };
+
+        // 2. A <label> whose text matches — the usual framework pattern.
+        var labels = document.querySelectorAll('label');
+        for (var i = 0; i < labels.length; i++) {
+            if (!match(labels[i].textContent)) continue;
+            var forId = labels[i].getAttribute('for');
+            if (forId) {
+                var byFor = document.getElementById(forId);
+                if (byFor) return byFor;
+            }
+            // Label wrapping its control, no `for` attribute.
+            var nested = labels[i].querySelector('input, textarea, select');
+            if (nested) return nested;
+            // Label as a visual sibling of the field's container.
+            var sib = labels[i].parentElement
+                ? labels[i].parentElement.querySelector('input, textarea, select')
+                : null;
+            if (sib) return sib;
+        }
+
+        // 3. aria-label / aria-labelledby / placeholder / name / id.
+        for (var j = 0; j < fields.length; j++) {
+            var f = fields[j];
+            if (!visible(f)) continue;
+            if (match(f.getAttribute('aria-label'))) return f;
+            if (match(f.getAttribute('placeholder'))) return f;
+            if (match(f.getAttribute('name'))) return f;
+            if (match(f.getAttribute('id'))) return f;
+            var labelledBy = f.getAttribute('aria-labelledby');
+            if (labelledBy) {
+                var ref = document.getElementById(labelledBy);
+                if (ref && match(ref.textContent)) return f;
+            }
+        }
+        return null;
+    }
+    """
+
+    # Sets a value the way a real user would, so framework-controlled inputs
+    # actually register the change.
+    #
+    # React (and Vue/Svelte to a lesser degree) install a `_valueTracker` on
+    # the node and read the value through a native prototype setter. Assigning
+    # `el.value` directly updates the tracker's cached copy, so the synthetic
+    # onChange sees "no change" and drops the edit — the field looks filled but
+    # submits empty. Clearing the tracker first and going through the native
+    # setter makes the change visible.
+    #
+    # Note: `_valueTracker` is an expando and expandos are per-execution-world,
+    # so from an isolated world it reads as undefined. That is fine and
+    # deliberate — the guard below skips the reset, and the native setter alone
+    # still triggers the framework listener because *events* cross worlds even
+    # though properties do not. Verified against React 18.
+    _SETTER_JS = """
+    function __rb_setValue(el, value) {
+        var proto = Object.getPrototypeOf(el);
+        var desc = Object.getOwnPropertyDescriptor(proto, 'value')
+                || Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+        if (el.isContentEditable) {
+            el.focus();
+            el.textContent = value;
+            el.dispatchEvent(new Event('input', {bubbles: true}));
+            return true;
+        }
+        if (el._valueTracker && typeof el._valueTracker.setValue === 'function') {
+            el._valueTracker.setValue('');
+        }
+        if (desc && desc.set) {
+            desc.set.call(el, value);
+        } else {
+            el.value = value;
+        }
+        el.dispatchEvent(new Event('input', {bubbles: true}));
+        el.dispatchEvent(new Event('change', {bubbles: true}));
+        return true;
+    }
+    """
+
+    async def wait_for_selector(self, selector: str, timeout: float = 5.0) -> bool:
+        """Poll until *selector* resolves to an element, or *timeout* elapses.
+
+        Frameworks mount asynchronously, so a selector that is absent on the
+        first query is usually just late rather than wrong. Callers that skip
+        this see a spurious "element not found" on every client-rendered page.
+        """
+        deadline = _time.monotonic() + timeout
+        expr = self._RESOLVER_JS + f"\n__rb_resolve({json.dumps(selector)}) !== null"
+        while True:
+            if await self.evaluate_bool(f"(function() {{ {expr} }})()") is True:
+                return True
+            if _time.monotonic() >= deadline:
+                return False
+            await _aio.sleep(0.25)
+
+    async def click(self, selector: str, timeout: float = 5.0, wait_for_navigation: bool = True) -> bool:
+        """Click an element matching a CSS selector or a label/placeholder.
+
+        Waits up to *timeout* seconds for the target to appear before giving
+        up. If *wait_for_navigation* is True (default), polls location.href
+        after the click to detect SSO/redirect chains and waits for URL
+        stability. Returns True if the click succeeded.
+        """
+        if not await self.wait_for_selector(selector, timeout):
+            logger.warning("click: %r did not resolve within %.1fs", selector, timeout)
+            return False
+
         url_before = ""
         if wait_for_navigation:
             try:
                 url_before = await self.evaluate("location.href") or ""
             except Exception:
                 pass
-        selector_json = json.dumps(selector)
+
         js = f"""
         (function() {{
-            const el = document.querySelector({selector_json});
+            {self._RESOLVER_JS}
+            var el = __rb_resolve({json.dumps(selector)});
             if (!el) return false;
+            if (typeof el.scrollIntoView === 'function') {{
+                el.scrollIntoView({{block: 'center', inline: 'center'}});
+            }}
             el.click();
             return true;
         }})()
         """
-        result = await self.evaluate(js)
-        # CDP returns Python bool → str(True) = "True", not "true"
-        ok = result in ("true", "True") or result is True
+        ok = await self.evaluate_bool(js) is True
         if ok and wait_for_navigation and url_before:
             await self._wait_for_url_stability(url_before)
         return ok
 
     async def fill(self, selector: str, value: str, timeout: float = 5.0) -> bool:
-        """Fill an input element with a value.
-        Returns True if the fill succeeded."""
-        selector_json = json.dumps(selector)
-        value_json = json.dumps(value)
+        """Fill an input, textarea, select or contenteditable with *value*.
+
+        *selector* may be a CSS selector or a human-readable handle such as a
+        label, placeholder or aria-label. Waits up to *timeout* for the target
+        to mount, then sets the value in a way framework-controlled inputs
+        register (see ``_SETTER_JS``). Returns True if the fill succeeded.
+        """
+        if not await self.wait_for_selector(selector, timeout):
+            logger.warning("fill: %r did not resolve within %.1fs", selector, timeout)
+            return False
+
         js = f"""
         (function() {{
-            const el = document.querySelector({selector_json});
+            {self._RESOLVER_JS}
+            {self._SETTER_JS}
+            var el = __rb_resolve({json.dumps(selector)});
             if (!el) return false;
-            el.value = {value_json};
-            el.dispatchEvent(new Event('input', {{bubbles: true}}));
-            el.dispatchEvent(new Event('change', {{bubbles: true}}));
-            return true;
+            if (typeof el.scrollIntoView === 'function') {{
+                el.scrollIntoView({{block: 'center', inline: 'center'}});
+            }}
+            if (typeof el.focus === 'function') el.focus();
+            return __rb_setValue(el, {json.dumps(value)});
         }})()
         """
-        result = await self.evaluate(js)
-        return result in ("true", "True") or result is True
+        if await self.evaluate_bool(js) is not True:
+            return False
+
+        # Verify the value actually stuck. A framework that rejects or
+        # reformats the input (masked fields, controlled components with
+        # validation) leaves the DOM value different from what we wrote —
+        # reporting success there would hide the failure from the caller.
+        verify = f"""
+        (function() {{
+            {self._RESOLVER_JS}
+            var el = __rb_resolve({json.dumps(selector)});
+            if (!el) return false;
+            var actual = el.isContentEditable ? el.textContent : el.value;
+            return actual === {json.dumps(value)};
+        }})()
+        """
+        if await self.evaluate_bool(verify) is not True:
+            logger.warning(
+                "fill: %r did not retain the value (controlled/masked input?)", selector
+            )
+            return False
+        return True
 
     async def _wait_for_url_stability(self, url_before: str) -> None:
         """Poll location.href until the URL stops changing or times out.

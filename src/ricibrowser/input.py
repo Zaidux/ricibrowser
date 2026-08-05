@@ -25,6 +25,7 @@ Usage::
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import random
@@ -162,18 +163,25 @@ class HumanMouse:
         await self._dispatch("mouseReleased", click_x, click_y, button="left", buttons=0, click_count=1)
 
     async def click_element(self, session, selector: str) -> bool:
-        """Move + click a DOM element by CSS selector.
+        """Move + click a DOM element by CSS selector, label or placeholder.
 
         Gets the element's bounding box via a single JS evaluation (returns
         JSON), moves to its center (with jitter), and clicks. Falls back to
         session.click() if box retrieval fails.
         """
-        # Single evaluation — returns JSON with coordinates or null.
+        # Single evaluation — returns JSON with coordinates or null. Scrolls
+        # first: a box outside the viewport yields coordinates the mouse
+        # events cannot reach, so the click would land on nothing.
         box_js = f"""
         (function() {{
-            var el = document.querySelector({selector!r});
+            {session._RESOLVER_JS}
+            var el = __rb_resolve({json.dumps(selector)});
             if (!el) return JSON.stringify(null);
+            if (typeof el.scrollIntoView === 'function') {{
+                el.scrollIntoView({{block: 'center', inline: 'center'}});
+            }}
             var rect = el.getBoundingClientRect();
+            if (!rect.width && !rect.height) return JSON.stringify(null);
             return JSON.stringify({{x: rect.x + rect.width / 2, y: rect.y + rect.height / 2}});
         }})()
         """
@@ -193,33 +201,46 @@ class HumanMouse:
     async def type_text(self, session, selector: str, text: str) -> bool:
         """Type text into an input element with human-like timing.
 
-        Focuses the element, clears it, then types each character with
+        Focuses and clears the element, then types each character with
         variable 50-150ms delays (matching real typing speed).
+
+        Clearing goes through the session's framework-safe setter rather than
+        assigning ``el.value = ''`` — a raw assignment leaves React's value
+        tracker holding the old string, so the component never sees the reset.
         """
-        # Focus the element and clear it
-        focus_js = f"""
-        (function() {{
-            var el = document.querySelector({selector!r});
-            if (!el) return false;
-            el.focus();
-            el.value = '';
-            return true;
-        }})()
-        """
-        result = await session.evaluate(focus_js)
-        if result not in ("true", "True", True):
+        # Focus and clear via the framework-safe path, reusing the session's
+        # resolver so labels/placeholders work here too.
+        if not await session.fill(selector, "", timeout=5.0):
             return False
 
-        # Type each character with CDP Input.dispatchKeyEvent
+        focused = await session.evaluate_bool(
+            f"""
+            (function() {{
+                {session._RESOLVER_JS}
+                var el = __rb_resolve({json.dumps(selector)});
+                if (!el || typeof el.focus !== 'function') return false;
+                el.focus();
+                return document.activeElement === el;
+            }})()
+            """
+        )
+        if focused is not True:
+            return False
+
+        # Type each character with CDP Input.dispatchKeyEvent. `text` alone
+        # produces a char event but no key identity; frameworks listening for
+        # keydown/keyup (validation, masking, autocomplete) need `key` too.
         for char in text:
             try:
                 await self._cdp.send("Input.dispatchKeyEvent", {
                     "type": "keyDown",
                     "text": char,
+                    "key": char,
+                    "unmodifiedText": char,
                 })
                 await self._cdp.send("Input.dispatchKeyEvent", {
                     "type": "keyUp",
-                    "text": char,
+                    "key": char,
                 })
                 # Variable typing delay (50-150ms)
                 await asyncio.sleep(random.uniform(0.05, 0.15))
@@ -227,8 +248,31 @@ class HumanMouse:
                 # Fallback: use fill
                 return await session.fill(selector, text)
 
-        # Trigger input/change events
+        # Trigger input/change so controlled components commit the value.
         await session.evaluate(
-            f"document.querySelector({selector!r})?.dispatchEvent(new Event('input', {{bubbles: true}}))"
+            f"""
+            (function() {{
+                {session._RESOLVER_JS}
+                var el = __rb_resolve({json.dumps(selector)});
+                if (!el) return false;
+                el.dispatchEvent(new Event('input', {{bubbles: true}}));
+                el.dispatchEvent(new Event('change', {{bubbles: true}}));
+                return true;
+            }})()
+            """
         )
-        return True
+
+        # Confirm the characters actually landed — CDP key events go to the
+        # focused node, so a stolen focus (modal, autocomplete popup) silently
+        # types into the wrong place.
+        return await session.evaluate_bool(
+            f"""
+            (function() {{
+                {session._RESOLVER_JS}
+                var el = __rb_resolve({json.dumps(selector)});
+                if (!el) return false;
+                var actual = el.isContentEditable ? el.textContent : el.value;
+                return actual === {json.dumps(text)};
+            }})()
+            """
+        ) is True
