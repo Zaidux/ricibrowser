@@ -546,14 +546,28 @@ class Session:
             return null;
         }
 
+        function allWithShadow(sel) {
+            var found = [];
+            function collect(root) {
+                try {
+                    var hits = root.querySelectorAll(sel);
+                    for (var i = 0; i < hits.length; i++) found.push(hits[i]);
+                } catch (e) {}
+                var walker = root.querySelectorAll('*');
+                for (var j = 0; j < walker.length; j++) {
+                    if (walker[j].shadowRoot) collect(walker[j].shadowRoot);
+                }
+            }
+            collect(document);
+            return found;
+        }
+
         // 1. Treat it as a CSS selector (including inside shadow roots).
         var el = deepQuery(document, target);
         if (el) return el;
 
         var needle = String(target).trim().toLowerCase();
-        var fields = Array.prototype.slice.call(
-            document.querySelectorAll('input, textarea, select, [contenteditable="true"]')
-        );
+        var fields = allWithShadow('input, textarea, select, [contenteditable="true"]');
         var visible = function (node) {
             if (!node) return false;
             var r = node.getBoundingClientRect();
@@ -568,13 +582,18 @@ class Session:
         };
 
         // 2. A <label> whose text matches — the usual framework pattern.
-        var labels = document.querySelectorAll('label');
+        //    Now scans shadow roots so a label inside a web component is found.
+        var labels = allWithShadow('label');
         for (var i = 0; i < labels.length; i++) {
             if (!match(labels[i].textContent)) continue;
             var forId = labels[i].getAttribute('for');
             if (forId) {
-                var byFor = document.getElementById(forId);
-                if (byFor) return byFor;
+                // An explicit `for` is an unambiguous statement of intent. If
+                // it dangles, STOP rather than falling through to the sibling
+                // heuristics below — those would return some unrelated nearby
+                // input, and silently filling the wrong field is worse than
+                // failing. getElementById can't pierce shadow; deepQuery can.
+                return deepQuery(document, '#' + CSS.escape(forId));
             }
             // Label wrapping its control, no `for` attribute.
             var nested = labels[i].querySelector('input, textarea, select');
@@ -587,6 +606,7 @@ class Session:
         }
 
         // 3. aria-label / aria-labelledby / placeholder / name / id.
+        //    Now uses the shadow-aware field list from allWithShadow above.
         for (var j = 0; j < fields.length; j++) {
             var f = fields[j];
             if (!visible(f)) continue;
@@ -596,7 +616,7 @@ class Session:
             if (match(f.getAttribute('id'))) return f;
             var labelledBy = f.getAttribute('aria-labelledby');
             if (labelledBy) {
-                var ref = document.getElementById(labelledBy);
+                var ref = deepQuery(document, '#' + CSS.escape(labelledBy));
                 if (ref && match(ref.textContent)) return f;
             }
         }
