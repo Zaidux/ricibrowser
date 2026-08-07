@@ -84,13 +84,20 @@ BASIC_FLAGS: list[str] = [
 
 
 def get_stealth_args(stealth: bool = True, proxy: str | None = None,
-                     extra: list[str] | None = None) -> list[str]:
+                     extra: list[str] | None = None,
+                     ignore_cert_errors: bool | None = None) -> list[str]:
     """Build Chrome launch argument list.
 
     Args:
         stealth: If True, use full stealth flags. If False, use basic flags.
         proxy: Optional proxy URL (e.g. http://127.0.0.1:8080).
         extra: Additional flags to append.
+        ignore_cert_errors: Trust otherwise-invalid TLS certs for this session.
+            ``None`` (default) means *auto*: enabled whenever ``proxy`` is set,
+            disabled otherwise. A MITM intercept proxy (miniproxy/mitmproxy)
+            presents its own self-signed CA, so without this Chrome rejects every
+            HTTPS response with ``NET::ERR_CERT_AUTHORITY_INVALID``. Pass an
+            explicit bool to override the auto behaviour.
 
     Returns:
         List of Chrome command-line arguments.
@@ -100,4 +107,24 @@ def get_stealth_args(stealth: bool = True, proxy: str | None = None,
         args.append(f"--proxy-server={proxy}")
     if extra:
         args.extend(extra)
+
+    # Auto-trust the proxy's CA when going through a proxy, unless the caller
+    # explicitly overrides. Scoped this way so ordinary (non-proxied) browsing
+    # keeps full certificate validation and fidelity. Added last, after `extra`,
+    # so the membership guards dedupe against every other flag too.
+    if ignore_cert_errors is None:
+        ignore_cert_errors = bool(proxy)
+    if ignore_cert_errors:
+        # --ignore-certificate-errors: blanket-accept invalid certs. Paired with
+        #   --test-type so recent Chrome (111+) actually honours it in
+        #   --headless=new instead of silently dropping the flag.
+        # --allow-insecure-localhost: covers proxies bound to localhost.
+        for flag in (
+            "--ignore-certificate-errors",
+            "--allow-insecure-localhost",
+            "--test-type",
+        ):
+            if flag not in args:
+                args.append(flag)
+
     return args

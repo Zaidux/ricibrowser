@@ -218,6 +218,7 @@ class Engine:
             viewport_width=self.config.viewport_width,
             viewport_height=self.config.viewport_height,
             user_agent=self.config.user_agent,
+            ignore_cert_errors=self.config.ignore_cert_errors,
         )
 
         import httpx

@@ -55,6 +55,14 @@ class EngineConfig:
     user_agent: str | None = None
     timeout: float = 30.0
     extra_chrome_args: list[str] = field(default_factory=list)
+    ignore_cert_errors: bool | None = None
+    """Trust otherwise-invalid TLS certificates (self-signed, expired, wrong host).
+
+    ``None`` (default) means *auto*: enabled when ``proxy_url`` is set (MITM
+    intercept proxies present their own CA), disabled otherwise. Pass an explicit
+    bool to override the auto behaviour. When enabled, adds
+    ``--ignore-certificate-errors`` and related flags to Chrome launch args.
+    """
     # ── Extension modules (opt-in) ──────────────────────────────────
     fingerprint_shield: bool = False
     """Canvas/WebGL/audio fingerprint randomization (opt-in, uses JS injection)."""

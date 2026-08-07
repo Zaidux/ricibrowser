@@ -77,6 +77,7 @@ def launch_chrome(
     viewport_width: int = 1920,
     viewport_height: int = 1080,
     user_agent: str | None = None,
+    ignore_cert_errors: bool | None = None,
 ) -> subprocess.Popen:
     """Launch Chrome with a remote debugging port for CDP access.
 
@@ -112,7 +113,8 @@ def launch_chrome(
     args.append("--remote-debugging-address=127.0.0.1")
 
     # Stealth / basic args
-    args.extend(get_stealth_args(stealth=stealth, proxy=proxy, extra=extra_args))
+    args.extend(get_stealth_args(stealth=stealth, proxy=proxy, extra=extra_args,
+                                  ignore_cert_errors=ignore_cert_errors))
 
     # User data dir for profile persistence (cf_clearance, site cookies)
     if user_data_dir:
