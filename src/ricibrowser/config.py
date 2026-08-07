@@ -87,6 +87,11 @@ class EngineConfig:
         if isinstance(self.thorough_engine, str):
             self.thorough_engine = EngineType(self.thorough_engine)
 
+        # When routing through a proxy, bump the navigation timeout to
+        # account for per-flow proxy overhead on asset-heavy SPAs.
+        if self.proxy_url and self.nav_timeout <= 30.0:
+            self.nav_timeout = 90.0
+
         # Resolve default lightpanda URL from env
         env_url = os.environ.get("RICIBROWSER_LIGHTPANDA_URL")
         if env_url:

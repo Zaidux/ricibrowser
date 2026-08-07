@@ -270,9 +270,13 @@ class Engine:
             if self._network.enabled:
                 await self._network.start(client)
 
+            # When proxied, avoid "networkidle" — a slow proxy can keep
+            # in-flight resource counters from ever settling. Fall back to
+            # "load" (Page.loadEventFired) which still fires reliably.
+            _want_networkidle = self._network.enabled and not self.config.proxy_url
             page = await session.navigate(
                 url,
-                wait_until="networkidle" if self._network.enabled else "load",
+                wait_until="networkidle" if _want_networkidle else "load",
                 max_chars=max_chars,
             )
 
