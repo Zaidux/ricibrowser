@@ -34,5 +34,17 @@ from ricibrowser.config import EngineConfig, EngineType
 from ricibrowser.engine import Engine
 from ricibrowser.session import Page, Session
 
-__version__ = "0.2.12"
+# Read the version from installed package metadata so it can never drift from
+# pyproject.toml (previously a hardcoded string that was left stale for several
+# releases). Falls back to "0.0.0" when running from an uninstalled source tree.
+try:
+    from importlib.metadata import version as _pkg_version, PackageNotFoundError
+
+    try:
+        __version__ = _pkg_version("ricibrowser")
+    except PackageNotFoundError:
+        __version__ = "0.0.0"
+except Exception:  # pragma: no cover - defensive
+    __version__ = "0.0.0"
+
 __all__ = ["Engine", "EngineConfig", "EngineType", "Page", "Session"]
