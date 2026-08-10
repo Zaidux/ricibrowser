@@ -199,5 +199,117 @@ async def test_frame_listener_ignores_subframes():
     assert session._isolated_context_id is None
 
 
+def _navigating_client(doc_events, *, final_url="http://t/", html=""):
+    """Client that fires Network.responseReceived events during navigate.
+
+    *doc_events* is the raw list of event params to emit once Page.navigate has
+    returned (mirroring Chrome, which reports the document response between the
+    navigate command and the load event).
+    """
+    client = _make_client()
+
+    async def fake_send(method, params=None):
+        if method == "Page.navigate":
+            async def _fire():
+                await asyncio.sleep(0.01)
+                for event in doc_events:
+                    for cb in list(client._event_handlers.get("Network.responseReceived", [])):
+                        cb(event)
+                for cb in list(client._event_handlers.get("Page.loadEventFired", [])):
+                    cb({"timestamp": 1})
+            asyncio.create_task(_fire())
+            return {"frameId": "F1"}
+        if method == "Page.createIsolatedWorld":
+            return {"executionContextId": 7}
+        if method == "Runtime.evaluate":
+            expr = (params or {}).get("expression", "")
+            if "document.title" in expr and "html" in expr:
+                return {"result": {"value": {
+                    "title": "t", "html": html, "text": "t", "url": final_url,
+                }}}
+            if expr == "location.href":
+                return {"result": {"value": final_url}}
+            if "readyState" in expr:
+                return {"result": {"value": "complete"}}
+            return {"result": {"value": ""}}
+        if method == "Network.getCookies":
+            return {"cookies": []}
+        return {}
+
+    client.send = AsyncMock(side_effect=fake_send)
+    return client
+
+
+@pytest.mark.asyncio
+async def test_navigate_reports_document_status_code():
+    """status_code comes from the main-frame Document response, not a
+    hardcoded 0."""
+    client = _navigating_client([
+        {"type": "Document", "frameId": "F1",
+         "response": {"status": 404, "url": "http://t/"}},
+    ])
+    session = Session(client, "cdp_chrome")
+    session._url_stability_timeout = 0.0
+    session._nav_timeout = 2.0
+
+    page = await session.navigate("http://t/", wait_until="load")
+    assert page.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_navigate_ignores_subresource_and_subframe_status():
+    """A subresource response (type != Document) and a subframe document must
+    not become the page's status; the main frame's final hop wins."""
+    client = _navigating_client([
+        {"type": "Document", "frameId": "F1",
+         "response": {"status": 302, "url": "http://t/"}},
+        {"type": "Script", "frameId": "F1",
+         "response": {"status": 500, "url": "http://t/app.js"}},
+        {"type": "Document", "frameId": "CHILD",
+         "response": {"status": 403, "url": "http://ads/frame"}},
+        {"type": "Document", "frameId": "F1",
+         "response": {"status": 200, "url": "http://t/final"}},
+    ])
+    session = Session(client, "cdp_chrome")
+    session._url_stability_timeout = 0.0
+    session._nav_timeout = 2.0
+
+    page = await session.navigate("http://t/", wait_until="load")
+    assert page.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_navigate_status_zero_without_network_events():
+    """Engines that never emit Network.responseReceived still report 0 rather
+    than a stale value from a previous navigation."""
+    client = _navigating_client([])
+    session = Session(client, "cdp_chrome")
+    session._url_stability_timeout = 0.0
+    session._nav_timeout = 2.0
+    session._last_status_code = 200  # stale value from an earlier navigate
+
+    page = await session.navigate("http://t/", wait_until="load")
+    assert page.status_code == 0
+
+
+@pytest.mark.asyncio
+async def test_links_resolve_against_final_url_after_redirect():
+    """Relative links must resolve against the post-redirect document URL.
+    Resolving against the requested URL pointed links at the wrong host."""
+    client = _navigating_client(
+        [{"type": "Document", "frameId": "F1",
+          "response": {"status": 200, "url": "https://final.example/app/"}}],
+        final_url="https://final.example/app/",
+        html='<a href="dash">Dash</a>',
+    )
+    session = Session(client, "cdp_chrome")
+    session._url_stability_timeout = 0.0
+    session._nav_timeout = 2.0
+
+    page = await session.navigate("http://start.example/", wait_until="load")
+    assert page.final_url == "https://final.example/app/"
+    assert page.links == [{"text": "Dash", "href": "https://final.example/app/dash"}]
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

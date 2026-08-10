@@ -212,6 +212,6 @@ class GeolocationManager:
                 "Geolocation PARTIALLY applied: %s (missing: %s). "
                 "This may create a fingerprint inconsistency.",
                 parts_applied,
-                ["timezone", "locale", "geolocation", "device_metrics"]
-                - set(parts_applied),  # type: ignore
+                set(["timezone", "locale", "geolocation", "device_metrics"])
+                - set(parts_applied),
             )

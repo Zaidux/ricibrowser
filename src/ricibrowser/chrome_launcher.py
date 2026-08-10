@@ -14,6 +14,7 @@ import logging
 import os
 import shutil
 import signal
+import socket
 import subprocess
 from typing import Any
 
@@ -67,8 +68,29 @@ def find_chrome() -> str | None:
     return None
 
 
+def find_free_port() -> int:
+    """Reserve and return a free localhost TCP port.
+
+    Binding to port 0 lets the kernel hand out a port that is currently unused,
+    which is how each :class:`~ricibrowser.engine.Engine` gets its own debugging
+    port instead of every instance fighting over the fixed 9223. Two engines
+    sharing 9223 meant the second launch silently attached to the FIRST
+    Chrome's CDP endpoint, so concurrent sessions stomped on each other's tabs
+    and cookies.
+
+    There is an unavoidable race: the socket must be closed before Chrome can
+    bind the port, so another process could claim it in between. In practice the
+    kernel does not immediately recycle a just-released ephemeral port, and the
+    caller's startup health check surfaces the failure if it ever happens.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
 def launch_chrome(
-    port: int = 9223,
+    port: int = 0,
     proxy: str | None = None,
     stealth: bool = True,
     user_data_dir: str | None = None,
@@ -82,7 +104,10 @@ def launch_chrome(
     """Launch Chrome with a remote debugging port for CDP access.
 
     Args:
-        port: Remote debugging port (default 9223).
+        port: Remote debugging port. ``0`` (default) picks a free ephemeral
+            port. Callers that need to connect afterwards should resolve the
+            port themselves with :func:`find_free_port` and pass it in, since
+            the launched process handle does not expose it.
         proxy: Optional proxy URL (e.g. http://127.0.0.1:8080 for miniproxy).
         stealth: If True, suppress navigator.webdriver via launch flags.
         user_data_dir: Optional Chrome profile dir for cookie/cf_clearance persistence.
@@ -101,6 +126,9 @@ def launch_chrome(
             "No Chrome/Chromium/Edge binary found. Install Google Chrome "
             "(https://www.google.com/chrome/) or set it on $PATH."
         )
+
+    if not port:
+        port = find_free_port()
 
     args = [chrome_path]
 
@@ -183,6 +211,10 @@ def stop_chrome(proc: subprocess.Popen) -> None:
                 pass
 
 
-def get_debug_url(port: int = 9223) -> str:
-    """Return the HTTP CDP discovery URL for a Chrome instance."""
+def get_debug_url(port: int) -> str:
+    """Return the HTTP CDP discovery URL for a Chrome instance.
+
+    The port is required: with ephemeral ports there is no meaningful default,
+    and a defaulted one would silently point at another engine's browser.
+    """
     return f"http://127.0.0.1:{port}"

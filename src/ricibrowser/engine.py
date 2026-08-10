@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shutil
 import subprocess
+import tempfile
 from typing import Any
 
-from ricibrowser.chrome_launcher import get_debug_url, launch_chrome, stop_chrome
+from ricibrowser.chrome_launcher import find_free_port, get_debug_url, launch_chrome, stop_chrome
 from ricibrowser.cdp_client import CDPClient, CDPError
 from ricibrowser.config import EngineConfig, EngineType
 from ricibrowser.cookie_jar import CookieJar
@@ -45,6 +47,15 @@ class Engine:
         self.config = config or EngineConfig()
         self._lightpanda: LightpandaEngine | None = None
         self._chrome_proc: subprocess.Popen | None = None
+        # Per-instance Chrome isolation. Two Engines used to share the fixed
+        # default port (9223) and, with no user_data_dir configured, a shared
+        # profile: the second Engine's "launch" health check found the first
+        # Engine's Chrome already answering on that port and attached to it.
+        # Both then drove the same browser — tabs, cookies and navigations
+        # interleaved across supposedly independent engines. Each instance now
+        # gets its own port and its own profile directory.
+        self._chrome_port: int = self.config.chrome_debug_port or 0
+        self._temp_user_data_dir: str | None = None
         self._cookie_jar = CookieJar(self.config.cookie_jar_path)
         self._cookie_jar.load()
         self._network = NetworkCapture(enabled=self.config.debug_network)
@@ -135,6 +146,11 @@ class Engine:
                 logger.warning("Chrome stop failed: %s", exc)
             finally:
                 self._chrome_proc = None
+        # Remove the temp profile only after Chrome is gone, otherwise Chrome
+        # rewrites its lock/state files into the half-deleted directory.
+        if self._temp_user_data_dir:
+            shutil.rmtree(self._temp_user_data_dir, ignore_errors=True)
+            self._temp_user_data_dir = None
 
     # ── Lightpanda path ────────────────────────────────────────────
 
@@ -186,10 +202,12 @@ class Engine:
         is slow to start, and the silent hang when Chrome is alive but
         unresponsive.
         """
-        debug_url = get_debug_url(self.config.chrome_debug_port)
-
-        # If Chrome process exists and hasn't exited, verify it's responsive
+        # An already-running Chrome for THIS engine keeps its port; a fresh
+        # launch takes a newly reserved one. Reserving per launch (rather than
+        # once in __init__) also avoids handing Chrome a port that was free
+        # minutes ago but has since been taken.
         if self._chrome_proc and self._chrome_proc.poll() is None:
+            debug_url = get_debug_url(self._chrome_port)
             import httpx
             try:
                 async with httpx.AsyncClient(timeout=2.0) as http:
@@ -209,11 +227,25 @@ class Engine:
                 pass
             self._chrome_proc = None
 
+        self._chrome_port = self.config.chrome_debug_port or find_free_port()
+        debug_url = get_debug_url(self._chrome_port)
+
+        # Each engine needs its own profile: Chrome refuses to run two
+        # processes against one --user-data-dir (the second exits or, worse,
+        # hands the request to the first instance). Only allocate the temp dir
+        # once per engine so cf_clearance / session cookies survive a Chrome
+        # restart within the same engine's lifetime.
+        user_data_dir = self.config.user_data_dir
+        if not user_data_dir:
+            if not self._temp_user_data_dir:
+                self._temp_user_data_dir = tempfile.mkdtemp(prefix="ricibrowser_profile_")
+            user_data_dir = self._temp_user_data_dir
+
         self._chrome_proc = launch_chrome(
-            port=self.config.chrome_debug_port,
+            port=self._chrome_port,
             proxy=self.config.proxy_url,
             stealth=self.config.stealth,
-            user_data_dir=self.config.user_data_dir,
+            user_data_dir=user_data_dir,
             extra_args=self.config.extra_chrome_args,
             viewport_width=self.config.viewport_width,
             viewport_height=self.config.viewport_height,

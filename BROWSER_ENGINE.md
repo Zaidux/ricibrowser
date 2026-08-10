@@ -195,12 +195,16 @@ def find_chrome() -> str:
             return path
     raise RuntimeError("No Chrome/Chromium found on $PATH")
 
-def launch_chrome(port: int = 9223, proxy: str | None = None) -> subprocess.Popen:
-    """Launch Chrome with stealth flags (no JS injection)."""
+def launch_chrome(port: int = 0, proxy: str | None = None) -> subprocess.Popen:
+    """Launch Chrome with stealth flags (no JS injection).
+
+    port=0 picks a free ephemeral port so concurrent Engine instances each
+    drive their own Chrome instead of colliding on one shared browser.
+    """
     args = [
         find_chrome(),
         "--headless=new",                      # new headless mode (Chrome 112+)
-        f"--remote-debugging-port={port}",
+        f"--remote-debugging-port={port or find_free_port()}",
         "--disable-blink-features=AutomationControlled",  # suppress webdriver flag
         "--no-first-run",
         "--disable-default-apps",

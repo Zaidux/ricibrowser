@@ -28,7 +28,8 @@ class EngineConfig:
         fast_engine: Engine for crawl/recon/fast browse (default AUTO → Lightpanda).
         thorough_engine: Engine for DAST/sessions (default CDP_CHROME).
         lightpanda_url: CDP WebSocket URL for Lightpanda (default ws://127.0.0.1:9222).
-        chrome_debug_port: Remote debugging port for Chrome (default 9223).
+        chrome_debug_port: Remote debugging port for Chrome. 0 (default) means
+            each Engine instance picks its own free ephemeral port.
         proxy_url: Optional proxy URL (e.g. http://127.0.0.1:8080 for miniproxy).
         cookie_jar_path: Path to persistent cookie/localStorage JSON file.
         debug_network: If True, capture request/response via CDP Network domain.
@@ -44,12 +45,25 @@ class EngineConfig:
     fast_engine: EngineType = EngineType.AUTO
     thorough_engine: EngineType = EngineType.CDP_CHROME
     lightpanda_url: str = "ws://127.0.0.1:9222"
-    chrome_debug_port: int = 9223
+    chrome_debug_port: int = 0
+    """Remote debugging port for Chrome.
+
+    ``0`` (default) means *ephemeral*: each :class:`~ricibrowser.engine.Engine`
+    binds its own free port, so concurrent Engine instances drive separate
+    Chrome processes. Set an explicit port only when you need to reach the
+    browser from outside the process (debugging, an external CDP tool) — doing
+    so reintroduces the shared-browser collision between Engines.
+    """
     proxy_url: str | None = None
     cookie_jar_path: str | None = None
     debug_network: bool = False
     stealth: bool = True
     user_data_dir: str | None = None
+    """Chrome profile dir for cookie/cf_clearance persistence.
+
+    ``None`` means each Engine instance creates (and removes on close) its own
+    temp profile, so concurrent instances never share profile state.
+    """
     viewport_width: int = 1920
     viewport_height: int = 1080
     user_agent: str | None = None

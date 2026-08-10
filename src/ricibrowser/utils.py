@@ -48,10 +48,26 @@ def strip_html(html: str) -> str:
     }
     for entity, char in entities.items():
         text = text.replace(entity, char)
-    # Decode numeric entities (decimal)
-    text = re.sub(r"&#(\d+);", lambda m: chr(int(m.group(1))), text)
-    # Decode numeric entities (hex)
-    text = re.sub(r"&#x([0-9a-fA-F]+);", lambda m: chr(int(m.group(1), 16)), text)
+    # Decode numeric entities (decimal) — clamp to valid Unicode range
+    def _safe_chr_dec(m):
+        cp = int(m.group(1))
+        if 0 <= cp <= 0x10FFFF:
+            try:
+                return chr(cp)
+            except (ValueError, OverflowError):
+                return ""
+        return ""
+    text = re.sub(r"&#(\d+);", _safe_chr_dec, text)
+    # Decode numeric entities (hex) — clamp to valid Unicode range
+    def _safe_chr_hex(m):
+        cp = int(m.group(1), 16)
+        if 0 <= cp <= 0x10FFFF:
+            try:
+                return chr(cp)
+            except (ValueError, OverflowError):
+                return ""
+        return ""
+    text = re.sub(r"&#x([0-9a-fA-F]+);", _safe_chr_hex, text)
     # Collapse whitespace
     text = re.sub(r"\s+", " ", text).strip()
     return text

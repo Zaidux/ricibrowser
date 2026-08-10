@@ -12,7 +12,7 @@ layer built entirely on CDP (Chrome DevTools Protocol).
 │     (fall back to Chrome)     │  → CDP-Chrome       │
 ├──────────────┬───────────────┼──────────────────────┤
 │  Lightpanda  │   CDP Client  │   CookieJar / Network│
-│  (ws://9222) │   (ws://9223)  │   (opt-in capture)   │
+│  (ws://9222) │  (ephemeral)   │   (opt-in capture)   │
 └──────┬───────┴───────┬───────┴──────────────────────┘
        │               │
        ▼               ▼

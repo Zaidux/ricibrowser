@@ -96,6 +96,7 @@ class Session:
         self._isolated_context_id: int | None = None
         self._page_enabled = False
         self._current_url: str = ""
+        self._last_status_code: int = 0
         # Register for frame navigation events so we invalidate the isolated
         # context when the frame changes (link clicks, SPA navigations, etc.).
         self._setup_frame_listener()
@@ -225,6 +226,8 @@ class Session:
         """
         url = validate_url(url)
         await self._ensure_page_enabled()
+        # Stale status from a previous navigation must not leak into this one.
+        self._last_status_code = 0
 
         # Enable Network domain — needed for cookie capture across redirects
         # and for Network.getCookies to return cookies set during the redirect
@@ -247,6 +250,25 @@ class Session:
         load_future: "_aio.Future[dict]" = loop.create_future()
         expected_frame: dict[str, str] = {"id": ""}
 
+        # ── HTTP status capture ────────────────────────────────────────
+        # CDP exposes no "give me the current page's status code" call, so the
+        # only way to report a real status is to observe the document response
+        # as it arrives. We collect every ``type == "Document"`` response and
+        # pick the one belonging to the main frame afterwards. Registering the
+        # handler BEFORE Page.navigate matters: the response can land before the
+        # navigate command's own reply, and a late subscription would miss it.
+        doc_responses: list[dict[str, Any]] = []
+
+        def _on_response(params: dict) -> None:
+            if params.get("type") != "Document":
+                return
+            response = params.get("response") or {}
+            doc_responses.append({
+                "frameId": params.get("frameId", ""),
+                "status": int(response.get("status") or 0),
+                "url": response.get("url", ""),
+            })
+
         def _on_load(params: dict) -> None:
             if not load_future.done():
                 load_future.set_result(params)
@@ -258,6 +280,7 @@ class Session:
 
         self._cdp._event_handlers.setdefault("Page.loadEventFired", []).append(_on_load)
         self._cdp._event_handlers.setdefault("Page.frameStoppedLoading", []).append(_on_frame_stopped)
+        self._cdp._event_handlers.setdefault("Network.responseReceived", []).append(_on_response)
 
         try:
             result = await self._cdp.send("Page.navigate", {"url": url})
@@ -288,10 +311,17 @@ class Session:
                 logger.debug("load event not observed within %.1fs; falling back to poll", nav_timeout)
         finally:
             for name, cb in (("Page.loadEventFired", _on_load),
-                             ("Page.frameStoppedLoading", _on_frame_stopped)):
+                             ("Page.frameStoppedLoading", _on_frame_stopped),
+                             ("Network.responseReceived", _on_response)):
                 handlers = self._cdp._event_handlers.get(name)
                 if handlers and cb in handlers:
                     handlers.remove(cb)
+
+        # Resolve the main-frame document status from the collected responses.
+        # Prefer an exact frameId match; the frame id can be replaced mid-flight
+        # (cross-origin redirect chains mint a new one), so fall back to the last
+        # document response seen, which is the final hop of the chain.
+        self._last_status_code = self._resolve_status(doc_responses)
 
         # Supplementary content-stability wait (DOM settle for SPAs). This now
         # runs AFTER the new document has actually committed + loaded, so the
@@ -353,6 +383,27 @@ class Session:
 
         return await self._capture_page(url, max_chars=max_chars, known_final_url=first or None)
 
+    def _resolve_status(self, doc_responses: list[dict[str, Any]]) -> int:
+        """Pick the main-frame document status from observed responses.
+
+        ``Network.responseReceived`` fires for every response, including
+        subframes and each hop of a redirect chain. The status we want is the
+        one for the top-level document that actually committed:
+
+        1. The last response whose ``frameId`` matches the main frame — a
+           redirect chain reports 301/302 hops on the same frame, so the last
+           one is the final document.
+        2. Otherwise the last document response seen at all. Cross-origin
+           navigations can replace the main frame id mid-flight, leaving no
+           exact match; the final hop is still the right answer.
+        """
+        if not doc_responses:
+            return 0
+        for entry in reversed(doc_responses):
+            if self._frame_id and entry.get("frameId") == self._frame_id:
+                return int(entry.get("status") or 0)
+        return int(doc_responses[-1].get("status") or 0)
+
     async def _capture_page(self, url: str, max_chars: int = 10_000,
                             known_final_url: str | None = None) -> Page:
         """Capture the current page state into a Page object.
@@ -377,10 +428,16 @@ class Session:
         if not text and html:
             text = strip_html(html)
 
-        links = extract_links(html, url)
+        # Relative hrefs resolve against the document that actually rendered
+        # them, which after a redirect is final_url — not the requested url.
+        # Using the original url produced links pointing at the wrong host
+        # whenever a navigation redirected (SSO flows, http→https, /→/en/).
+        links = extract_links(html, final_url or url)
 
-        # Get HTTP status (not always available via CDP)
-        status_code = 0
+        # HTTP status observed via Network.responseReceived during navigate().
+        # Stays 0 when the page was reached some other way (direct capture,
+        # engines without the Network domain).
+        status_code = self._last_status_code
 
         # Get cookies
         cookies = await self.get_cookies()
@@ -490,17 +547,22 @@ class Session:
             return value
         return None
 
-    async def screenshot(self, path: str | None = None, full_page: bool = False) -> str:
+    async def screenshot(self, path: str | None = None, full_page: bool = False) -> str | None:
         """Take a screenshot and save to a PNG file.
 
         Note: screenshots require a rendering engine. Lightpanda does NOT
         support this — the caller should use CDPChromeEngine for screenshots.
 
-        Returns the path to the saved PNG.
+        Returns the path to the saved PNG, or ``None`` if the capture failed.
+        A failed capture leaves no file behind: the empty temp file we created
+        up front is removed, because a 0-byte PNG masquerading as a successful
+        screenshot is worse than an explicit failure.
         """
+        created_temp = False
         if path is None:
             fd, path = tempfile.mkstemp(suffix=".png", prefix="ricibrowser_")
             os.close(fd)
+            created_temp = True
 
         params: dict[str, Any] = {"format": "png"}
         if full_page:
@@ -513,10 +575,16 @@ class Session:
                 with open(path, "wb") as f:
                     f.write(base64.b64decode(data_b64))
                 return path
+            logger.warning("Screenshot returned no data")
         except CDPError as exc:
             logger.warning("Screenshot failed: %s", exc)
 
-        return path
+        if created_temp:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        return None
 
     # ── Element resolution ────────────────────────────────────────────
     #
@@ -672,7 +740,7 @@ class Session:
         this see a spurious "element not found" on every client-rendered page.
         """
         deadline = _time.monotonic() + timeout
-        expr = self._RESOLVER_JS + f"\n__rb_resolve({json.dumps(selector)}) !== null"
+        expr = self._RESOLVER_JS + f"\nreturn __rb_resolve({json.dumps(selector)}) !== null"
         while True:
             if await self.evaluate_bool(f"(function() {{ {expr} }})()") is True:
                 return True

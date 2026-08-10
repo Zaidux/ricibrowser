@@ -6,9 +6,10 @@ gets a fully-rendered page instead of a half-loaded SPA.
 Three modes:
   - "load" — wait for Page.loadEventFired (basic, unreliable for SPAs).
   - "domcontentloaded" — wait for DOMContentLoaded (fastest, least reliable).
-  - "networkidle" — poll for network requests to settle + DOM size to stop
-    changing (most reliable, requires Network.enable which is a detection
-    vector — only used when explicitly requested).
+  - "networkidle" — wait for in-flight requests (tracked via CDP Network
+    events) to drain + DOM size to stop changing (most reliable, requires
+    Network.enable which is a detection vector — only used when explicitly
+    requested).
 """
 
 from __future__ import annotations
@@ -47,8 +48,8 @@ async def wait_for_content_stable(
     elif mode == "networkidle":
         await _wait_ready_state(cdp, "interactive", timeout)
         await _wait_dom_stable(cdp, timeout)
-        # Best-effort network idle check: poll for pending requests via
-        # CDP. If Network domain isn't enabled, this is a no-op.
+        # Event-driven network idle: counts in-flight requests from CDP
+        # Network events (no page instrumentation).
         await _wait_network_idle(cdp, timeout=5.0)
     elif mode == "domstable":
         await _wait_ready_state(cdp, "interactive", timeout)
@@ -117,55 +118,75 @@ async def _wait_dom_stable(cdp: CDPClient, timeout: float = 10.0) -> None:
     logger.debug("wait_dom_stable timeout after %.1fs (stable_count=%d)", timeout, stable_count)
 
 
-async def _wait_network_idle(cdp: CDPClient, timeout: float = 5.0) -> None:
-    """Best-effort network-idle check using Network domain CDP API.
+async def _wait_network_idle(cdp: CDPClient, timeout: float = 5.0,
+                             quiet_period: float = 0.5) -> None:
+    """Wait until no network request has been in flight for *quiet_period*.
 
-    Since session.py now enables Network.enable by default (required for
-    SSO redirect cookie capture), we can check for inflight network requests
-    via a JS counter that tracks XMLHttpRequest and fetch() in progress.
-    """
-    _NET_IDLE_JS = """
-    (function() {
-        if (window.__ricibrowser_net_idle_active === true) return (window.__ricibrowser_net_outstanding || 0);
-        window.__ricibrowser_net_idle_active = true;
-        window.__ricibrowser_net_outstanding = 0;
-        var _origFetch = window.fetch;
-        window.fetch = function() {
-            window.__ricibrowser_net_outstanding++;
-            var p = _origFetch.apply(this, arguments);
-            p.finally(function() { window.__ricibrowser_net_outstanding--; });
-            return p;
-        };
-        var _origXHROpen = XMLHttpRequest.prototype.open;
-        XMLHttpRequest.prototype.open = function() {
-            this.addEventListener('loadend', function() { window.__ricibrowser_net_outstanding--; });
-            window.__ricibrowser_net_outstanding++;
-            return _origXHROpen.apply(this, arguments);
-        };
-        return 0;
-    })()
-    """
-    import time
-    deadline = time.monotonic() + timeout
+    In-flight requests are counted from CDP ``Network`` events —
+    ``requestWillBeSent`` to open, ``loadingFinished``/``loadingFailed`` to
+    close. The previous implementation injected a ``fetch``/``XMLHttpRequest``
+    wrapper into the page, which was both a detection vector (a patched
+    ``window.fetch`` is trivially observable from page script, and it was
+    injected into the MAIN world where site code can read it) and a
+    correctness problem (it ignored images, scripts, stylesheets and
+    navigations, and permanently mutated the page's globals).
 
-    # Inject the counter on first call (idempotent)
+    Requests already in flight before this function subscribes are invisible to
+    it — CDP has no "list pending requests" call. That only shortens the wait,
+    never hangs it, and the DOM-stability check that runs alongside covers the
+    common case.
+    """
+    # The Network domain must be on for the events to arrive. session.navigate()
+    # already enables it, but this helper is also reachable directly.
     try:
-        await cdp.send("Runtime.evaluate", {
-            "expression": _NET_IDLE_JS,
-            "returnByValue": True,
-        })
+        await cdp.send("Network.enable")
     except CDPError:
         return
 
-    while time.monotonic() < deadline:
-        try:
-            result = await cdp.send("Runtime.evaluate", {
-                "expression": "window.__ricibrowser_net_outstanding || 0",
-                "returnByValue": True,
-            })
-            value = result.get("result", {}).get("value", 0)
-            if not value or int(value) == 0:
-                return
-        except CDPError:
+    inflight: set[str] = set()
+    # Redirect hops re-fire requestWillBeSent for the SAME requestId; counting
+    # them again would leave a permanently unbalanced counter.
+    seen: set[str] = set()
+
+    def _on_request(params: dict) -> None:
+        request_id = params.get("requestId")
+        if not request_id or request_id in seen:
             return
-        await asyncio.sleep(0.3)
+        seen.add(request_id)
+        inflight.add(request_id)
+
+    def _on_done(params: dict) -> None:
+        request_id = params.get("requestId")
+        if request_id:
+            inflight.discard(request_id)
+
+    handlers = (
+        ("Network.requestWillBeSent", _on_request),
+        ("Network.loadingFinished", _on_done),
+        ("Network.loadingFailed", _on_done),
+    )
+    for name, cb in handlers:
+        cdp._event_handlers.setdefault(name, []).append(cb)
+
+    try:
+        deadline = time.monotonic() + timeout
+        quiet_since: float | None = time.monotonic()
+        while time.monotonic() < deadline:
+            if inflight:
+                quiet_since = None
+            else:
+                now = time.monotonic()
+                if quiet_since is None:
+                    quiet_since = now
+                elif now - quiet_since >= quiet_period:
+                    return
+            await asyncio.sleep(0.05)
+        logger.debug(
+            "wait_network_idle timeout after %.1fs (%d request(s) still in flight)",
+            timeout, len(inflight),
+        )
+    finally:
+        for name, cb in handlers:
+            registered = cdp._event_handlers.get(name)
+            if registered and cb in registered:
+                registered.remove(cb)

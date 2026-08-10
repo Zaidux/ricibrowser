@@ -188,7 +188,6 @@ class HumanMouse:
         box_result = await session.evaluate(box_js)
         if box_result:
             try:
-                import json
                 box = json.loads(box_result)
                 if box and "x" in box:
                     await self.click_at(box["x"], box["y"])
