@@ -464,7 +464,7 @@ class Session:
             engine=self._engine_name,
         )
 
-    async def evaluate(self, expression: str) -> str | None:
+    async def evaluate(self, expression: str) -> Any:
         """Evaluate JavaScript in an isolated world and return the result.
 
         NEVER calls Runtime.enable on the main world — uses
@@ -473,8 +473,26 @@ class Session:
         after an unobserved frame change), returns None with a warning
         rather than silently falling back to the main world.
         """
-        value = await self.evaluate_value(expression)
-        return str(value) if value is not None else None
+        return await self.evaluate_value(expression)
+
+    async def capture_storage(self) -> tuple[str, dict[str, str]]:
+        result = await self.evaluate_value("""({
+          origin: location.origin,
+          storage: Object.fromEntries(Object.entries(localStorage))
+        })""")
+        if not isinstance(result, dict):
+            return "", {}
+        origin = str(result.get("origin") or "")
+        storage = result.get("storage")
+        return origin, dict(storage) if isinstance(storage, dict) else {}
+
+    async def restore_storage(self, storage: dict[str, str]) -> None:
+        if not storage:
+            return
+        payload = json.dumps(storage)
+        await self.evaluate_value(
+            f"Object.entries({payload}).forEach(([k,v]) => localStorage.setItem(k, v)); true"
+        )
 
     async def evaluate_value(self, expression: str) -> Any:
         """Evaluate in the isolated world and preserve JSON-compatible types.

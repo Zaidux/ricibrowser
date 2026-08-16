@@ -279,11 +279,12 @@ class Engine:
                 except Exception:
                     pass
                 await asyncio.sleep(poll_interval)
-        logger.warning(
-            "Chrome did not become ready after %.0fs — proceeding anyway",
-            startup_timeout,
+        if self._chrome_proc is not None:
+            stop_chrome(self._chrome_proc)
+            self._chrome_proc = None
+        raise RuntimeError(
+            f"Chrome did not become ready after {startup_timeout:.0f}s"
         )
-        return debug_url
 
     async def _browse_chrome(self, url: str, max_chars: int, **kwargs) -> Page:
         """Browse via CDP-Chrome (thorough path)."""
@@ -311,12 +312,19 @@ class Engine:
                 wait_until="networkidle" if _want_networkidle else "load",
                 max_chars=max_chars,
             )
+            origin = page.final_url.split("/", 3)[:3]
+            origin = "/".join(origin) if len(origin) == 3 else ""
+            if origin:
+                await session.restore_storage(self._cookie_jar.get_storage(origin))
 
             # Save cookies back to jar
             cookies = await session.get_cookies()
             if cookies:
                 self._cookie_jar.update_cookies(cookies)
-                self._cookie_jar.save()
+            origin, storage = await session.capture_storage()
+            if origin and storage:
+                self._cookie_jar.set_storage(origin, storage)
+            self._cookie_jar.save()
 
             return page
         finally:

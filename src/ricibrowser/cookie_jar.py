@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import time
+import threading
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -41,13 +42,14 @@ class CookieJar:
     def __init__(self, path: str | None = None):
         self.path = path or os.path.expanduser("~/.config/ricibrowser/cookies.json")
         self._data: dict[str, Any] = {"cookies": [], "storage": {}}
+        self._lock = threading.RLock()
 
     def load(self) -> None:
         """Load the jar from disk (no-op if file doesn't exist)."""
         if not self.path or not os.path.exists(self.path):
             return
         try:
-            with open(self.path, encoding="utf-8") as file:
+            with self._lock, open(self.path, encoding="utf-8") as file:
                 self._data = json.load(file)
             if "cookies" not in self._data:
                 self._data["cookies"] = []
@@ -62,19 +64,20 @@ class CookieJar:
         """Save the jar to disk (atomic write with unique temp file)."""
         if not self.path:
             return
-        self._gc()
-        dir_path = os.path.dirname(self.path) or "."
-        os.makedirs(dir_path, exist_ok=True)
-        import tempfile
-        fd, tmp = tempfile.mkstemp(dir=dir_path, suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(self._data, f, indent=2, default=str)
-            os.chmod(tmp, 0o600)
-            os.replace(tmp, self.path)
-        except Exception:
-            os.unlink(tmp)
-            raise
+        with self._lock:
+            self._gc()
+            dir_path = os.path.dirname(self.path) or "."
+            os.makedirs(dir_path, exist_ok=True)
+            import tempfile
+            fd, tmp = tempfile.mkstemp(dir=dir_path, suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(self._data, f, indent=2, default=str)
+                os.chmod(tmp, 0o600)
+                os.replace(tmp, self.path)
+            except Exception:
+                os.unlink(tmp)
+                raise
 
     def _gc(self) -> None:
         """Remove expired cookies. Runs on load and before save."""
@@ -110,11 +113,17 @@ class CookieJar:
         are treated as the same logical cookie (per RFC 6265, the leading dot
         denotes a domain cookie matching all subdomains).
         """
-        existing = {(_norm_domain(c.get("domain", "")), c.get("name")): c for c in self.cookies}
-        for c in cookies:
-            key = (_norm_domain(c.get("domain", "")), c.get("name"))
-            existing[key] = c
-        self._data["cookies"] = list(existing.values())
+        with self._lock:
+            existing = {
+                (_norm_domain(c.get("domain", "")), c.get("path", "/"), c.get("name")): c
+                for c in self.cookies
+            }
+            for c in cookies:
+                key = (
+                    _norm_domain(c.get("domain", "")), c.get("path", "/"), c.get("name")
+                )
+                existing[key] = c
+            self._data["cookies"] = list(existing.values())
 
     def get_cookies_for_domain(self, domain: str) -> list[dict]:
         """Get cookies matching a domain (handles leading dot).
