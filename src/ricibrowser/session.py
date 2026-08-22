@@ -17,6 +17,7 @@ import logging
 import os
 import tempfile
 import time as _time
+import hashlib
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -59,6 +60,8 @@ class Page:
     """Path to screenshot PNG (None if not taken)."""
     engine: str = "unknown"
     """Which engine produced this page ('lightpanda' or 'cdp_chrome')."""
+    accessibility_snapshot: dict[str, Any] | None = None
+    """Hybrid accessibility/DOM snapshot when requested."""
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to a dict matching the existing tool_browse return format."""
@@ -79,6 +82,7 @@ class Page:
             "anti_bot_type": self.cloudflare_type,
             "screenshot_path": self.screenshot_path,
             "engine": self.engine,
+            "accessibility_snapshot": self.accessibility_snapshot,
         }
 
 
@@ -97,6 +101,9 @@ class Session:
         self._page_enabled = False
         self._current_url: str = ""
         self._last_status_code: int = 0
+        self._navigation_id: int = 0
+        self._snapshot_id: str = ""
+        self._snapshot_refs: dict[str, dict[str, Any]] = {}
         # Register for frame navigation events so we invalidate the isolated
         # context when the frame changes (link clicks, SPA navigations, etc.).
         self._setup_frame_listener()
@@ -127,6 +134,8 @@ class Session:
             if new_frame_id and new_frame_id != self._frame_id:
                 self._frame_id = new_frame_id
                 self._isolated_context_id = None
+                self._snapshot_id = ""
+                self._snapshot_refs = {}
                 if new_url:
                     self._current_url = new_url
                 logger.debug("Main frame navigated to %s, isolated context invalidated", new_url)
@@ -882,6 +891,76 @@ class Session:
     async def get_dom(self) -> str:
         """Return the full rendered DOM HTML."""
         return await self.evaluate("document.documentElement.outerHTML") or ""
+
+    async def accessibility_snapshot(
+        self, *, interactive_only: bool = False, max_nodes: int = 200,
+        max_depth: int = 12, include_values: bool = False,
+        include_bounds: bool = False,
+    ) -> dict[str, Any]:
+        """Return a hybrid CDP accessibility tree enriched with DOM references."""
+        self._navigation_id += 1
+        snapshot_id = "snap_" + hashlib.sha256(
+            f"{self._current_url}:{self._navigation_id}:{_time.monotonic_ns()}".encode()
+        ).hexdigest()[:16]
+        nodes: list[dict[str, Any]] = []
+        try:
+            tree = await self._cdp.send("Accessibility.getFullAXTree")
+            for raw in (tree.get("nodes") or []):
+                role = str((raw.get("role") or {}).get("value") or "generic")
+                name = str((raw.get("name") or {}).get("value") or "")
+                props = {item.get("name"): item.get("value", {}).get("value") for item in raw.get("properties", [])}
+                if interactive_only and role not in {"button", "link", "textbox", "checkbox", "radio", "combobox", "listbox", "option", "menuitem", "tab", "searchbox"}:
+                    continue
+                if len(nodes) >= max_nodes:
+                    break
+                ref = f"e{len(nodes) + 1}"
+                node = {"ref": ref, "role": role, "name": name,
+                        "disabled": props.get("disabled", False),
+                        "checked": props.get("checked", False),
+                        "level": props.get("level")}
+                if include_values:
+                    node["value"] = str((raw.get("value") or {}).get("value") or "")[:1000]
+                if include_bounds and raw.get("backendDOMNodeId"):
+                    node["backend_node_id"] = raw["backendDOMNodeId"]
+                nodes.append(node)
+        except Exception as exc:
+            logger.debug("CDP accessibility snapshot unavailable: %s", exc)
+
+        # DOM/ARIA enrichment supplies stable selectors and shadow-aware labels.
+        dom_result = await self.evaluate_value("""({url:location.href, elements:Array.from(document.querySelectorAll('a,button,input,textarea,select,[role]')).slice(0,500).map((el,i)=>({tag:el.tagName.toLowerCase(),role:el.getAttribute('role')||'',name:el.getAttribute('aria-label')||el.getAttribute('name')||el.getAttribute('placeholder')||el.textContent.trim().slice(0,120),id:el.id||'',type:el.getAttribute('type')||'',disabled:!!el.disabled}))})""")
+        dom_elements = dom_result.get("elements", []) if isinstance(dom_result, dict) else []
+        for index, node in enumerate(nodes):
+            if index < len(dom_elements):
+                dom = dom_elements[index]
+                node["selector"] = f"#{dom['id']}" if dom.get("id") else None
+                node["dom_role"] = dom.get("role") or dom.get("tag")
+                node["dom_name"] = dom.get("name")
+        self._snapshot_id = snapshot_id
+        self._snapshot_refs = {node["ref"]: node for node in nodes}
+        return {"snapshot_id": snapshot_id, "navigation_id": self._navigation_id,
+                "url": self._current_url, "nodes": nodes[:max_nodes],
+                "node_count": len(nodes), "truncated": len(nodes) >= max_nodes,
+                "source": "cdp_accessibility+dom_aria"}
+
+    async def act_reference(self, ref: str, action: str, value: str = "", snapshot_id: str = "") -> dict[str, Any]:
+        """Act on a snapshot reference, rejecting stale references explicitly."""
+        if not snapshot_id or snapshot_id != self._snapshot_id or ref not in self._snapshot_refs:
+            return {"status": "error", "success": False, "error_type": "stale_reference",
+                    "message": "Reference is stale or belongs to another page snapshot.",
+                    "required_action": "read_page"}
+        node = self._snapshot_refs[ref]
+        selector = node.get("selector") or node.get("dom_name")
+        if not selector:
+            return {"status": "error", "success": False, "error_type": "reference_unresolved",
+                    "message": f"Reference {ref} has no DOM selector; read_page with enrichment again."}
+        if action == "click":
+            ok = await self.click(selector)
+        elif action == "fill":
+            ok = await self.fill(selector, value)
+        else:
+            return {"status": "error", "success": False, "message": f"Unsupported reference action: {action}"}
+        return {"status": "ok" if ok else "error", "success": bool(ok), "ref": ref, "action": action,
+                "snapshot_id": snapshot_id, "message": "Action completed" if ok else "Action failed"}
 
     async def get_cookies(self) -> list[dict]:
         """Get all cookies from the browser context."""

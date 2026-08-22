@@ -24,6 +24,21 @@ lightpanda serve --host 127.0.0.1 --port 9222
 
 ## Quick start
 
+## Hybrid page snapshots
+
+CDP-Chrome sessions can expose a bounded accessibility/DOM snapshot with
+stable references for the current page. Refresh the snapshot after navigation
+or DOM changes; references from an older snapshot are rejected.
+
+```python
+snapshot = await session.accessibility_snapshot(interactive_only=True)
+# Use snapshot["nodes"][0]["ref"] with session.act_reference(...)
+```
+
+The snapshot combines the CDP accessibility tree with DOM/ARIA enrichment,
+including roles, accessible names, disabled/checked state, and selectors where
+available.
+
 ```python
 import asyncio
 from ricibrowser import Engine, EngineConfig
