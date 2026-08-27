@@ -946,6 +946,7 @@ class Session:
             f"{self._current_url}:{self._navigation_id}:{_time.monotonic_ns()}".encode()
         ).hexdigest()[:16]
         nodes: list[dict[str, Any]] = []
+        cdp_available = True
         try:
             tree = await self._cdp.send("Accessibility.getFullAXTree")
             for raw in (tree.get("nodes") or []):
@@ -967,23 +968,130 @@ class Session:
                     node["backend_node_id"] = raw["backendDOMNodeId"]
                 nodes.append(node)
         except Exception as exc:
+            cdp_available = False
             logger.debug("CDP accessibility snapshot unavailable: %s", exc)
 
         # DOM/ARIA enrichment supplies stable selectors and shadow-aware labels.
-        dom_result = await self.evaluate_value("""({url:location.href, elements:Array.from(document.querySelectorAll('a,button,input,textarea,select,[role]')).slice(0,500).map((el,i)=>({tag:el.tagName.toLowerCase(),role:el.getAttribute('role')||'',name:el.getAttribute('aria-label')||el.getAttribute('name')||el.getAttribute('placeholder')||el.textContent.trim().slice(0,120),id:el.id||'',type:el.getAttribute('type')||'',disabled:!!el.disabled}))})""")
+        # Each interactive element gets a computed CSS path (nth-of-type based,
+        # id/data-testid preferred) so references resolve even on ID-less
+        # React/SPA pages where '#id' selectors never exist.
+        _DOM_ENRICHMENT_JS = """(function(){
+            function cssPath(el){
+                if (el.id) return '#' + CSS.escape(el.id);
+                var parts = [];
+                var node = el;
+                while (node && node.nodeType === 1 && parts.length < 12){
+                    var seg = node.tagName.toLowerCase();
+                    if (node.id){ parts.unshift('#' + CSS.escape(node.id)); break; }
+                    var parent = node.parentNode;
+                    if (parent){
+                        var same = Array.prototype.filter.call(
+                            parent.children,
+                            function(c){ return c.tagName === node.tagName; }
+                        );
+                        if (same.length > 1){
+                            seg += ':nth-of-type(' + (same.indexOf(node) + 1) + ')';
+                        }
+                    }
+                    parts.unshift(seg);
+                    node = parent;
+                }
+                return parts.join(' > ');
+            }
+            return {
+                url: location.href,
+                elements: Array.from(document.querySelectorAll(
+                    'a,button,input,textarea,select,[role],[contenteditable="true"],[contenteditable=""]'
+                )).slice(0, 500).map(function(el){
+                    return {
+                        tag: el.tagName.toLowerCase(),
+                        role: el.getAttribute('role') || '',
+                        name: (el.getAttribute('aria-label') || el.getAttribute('name') ||
+                               el.getAttribute('placeholder') ||
+                               (el.textContent || '').trim().slice(0, 120)) || '',
+                        id: el.id || '',
+                        testid: el.getAttribute('data-testid') || '',
+                        path: cssPath(el),
+                        disabled: !!el.disabled
+                    };
+                })
+            };
+        })()"""
+        dom_result = await self.evaluate_value(_DOM_ENRICHMENT_JS)
         dom_elements = dom_result.get("elements", []) if isinstance(dom_result, dict) else []
-        for index, node in enumerate(nodes):
-            if index < len(dom_elements):
-                dom = dom_elements[index]
-                node["selector"] = f"#{dom['id']}" if dom.get("id") else None
-                node["dom_role"] = dom.get("role") or dom.get("tag")
-                node["dom_name"] = dom.get("name")
+
+        if not nodes:
+            # No CDP AX tree (unavailable or everything filtered out): fall
+            # back to DOM-only nodes so read_page still returns actionable refs.
+            tag_roles = {"a": "link", "button": "button", "input": "textbox",
+                         "textarea": "textbox", "select": "combobox"}
+            for dom in dom_elements[:max_nodes]:
+                role = dom.get("role") or tag_roles.get(dom.get("tag"), dom.get("tag") or "generic")
+                if interactive_only and role not in {"button", "link", "textbox", "checkbox", "radio", "combobox", "listbox", "option", "menuitem", "tab", "searchbox"}:
+                    continue
+                nodes.append({
+                    "ref": f"e{len(nodes) + 1}",
+                    "role": role, "name": dom.get("name") or "",
+                    "disabled": bool(dom.get("disabled")),
+                    "selector": self._best_dom_selector(dom),
+                    "dom_role": dom.get("role") or dom.get("tag"),
+                    "dom_name": dom.get("name"),
+                })
+        else:
+            # Match CDP nodes to DOM elements by (role, name) first, falling
+            # back to document order. Index-only matching was wrong whenever
+            # interactive_only filtered the CDP list but not the DOM list.
+            def _norm(value: Any) -> str:
+                return str(value or "").strip().lower()
+
+            consumed: set[int] = set()
+
+            def _claim_match(role: str, name: str) -> dict | None:
+                for idx, dom in enumerate(dom_elements):
+                    if idx in consumed:
+                        continue
+                    dom_role = dom.get("role") or self._TAG_ROLE_ALIASES.get(dom.get("tag"))
+                    if dom_role != role:
+                        continue
+                    if _norm(dom.get("name")) == _norm(name):
+                        consumed.add(idx)
+                        return dom
+                return None
+
+            next_seq = 0
+            for node in nodes:
+                dom = _claim_match(node.get("role", ""), node.get("name", ""))
+                if dom is None:
+                    while next_seq < len(dom_elements) and next_seq in consumed:
+                        next_seq += 1
+                    dom = dom_elements[next_seq] if next_seq < len(dom_elements) else None
+                    if dom is not None:
+                        consumed.add(next_seq)
+                        next_seq += 1
+                if dom is not None:
+                    node["selector"] = self._best_dom_selector(dom)
+                    node["dom_role"] = dom.get("role") or dom.get("tag")
+                    node["dom_name"] = dom.get("name")
         self._snapshot_id = snapshot_id
         self._snapshot_refs = {node["ref"]: node for node in nodes}
         return {"snapshot_id": snapshot_id, "navigation_id": self._navigation_id,
                 "url": self._current_url, "nodes": nodes[:max_nodes],
                 "node_count": len(nodes), "truncated": len(nodes) >= max_nodes,
-                "source": "cdp_accessibility+dom_aria"}
+                "source": "cdp_accessibility+dom_aria" if cdp_available and nodes else "dom_aria"}
+
+    _TAG_ROLE_ALIASES = {
+        "a": "link", "button": "button", "input": "textbox",
+        "textarea": "textbox", "select": "combobox",
+    }
+
+    @staticmethod
+    def _best_dom_selector(dom: dict) -> str:
+        """Pick the most stable selector for a DOM element record."""
+        if dom.get("id"):
+            return f"#{dom['id']}"
+        if dom.get("testid"):
+            return f"[data-testid=\"{dom['testid']}\"]"
+        return dom.get("path") or ""
 
     async def act_reference(self, ref: str, action: str, value: str = "", snapshot_id: str = "") -> dict[str, Any]:
         """Act on a snapshot reference, rejecting stale references explicitly."""
