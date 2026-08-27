@@ -521,6 +521,10 @@ class Session:
         params: dict[str, Any] = {
             "expression": expression,
             "returnByValue": True,
+            # Await promise-returning expressions so `fetch(...).then(...)`
+            # resolves to the final value instead of an opaque `{}`. Non-promise
+            # expressions are unaffected.
+            "awaitPromise": True,
         }
         if context_id is not None:
             params["contextId"] = context_id
@@ -779,9 +783,12 @@ class Session:
         """Click an element matching a CSS selector or a label/placeholder.
 
         Waits up to *timeout* seconds for the target to appear before giving
-        up. If *wait_for_navigation* is True (default), polls location.href
-        after the click to detect SSO/redirect chains and waits for URL
-        stability. Returns True if the click succeeded.
+        up. Dispatches a **trusted** CDP mouse event at the element's center
+        (React/Vue routers ignore untrusted ``el.click()`` dispatches) and
+        falls back to a synthetic click when coordinates or input dispatch
+        are unavailable. If *wait_for_navigation* is True (default), polls
+        location.href after the click to detect SSO/redirect chains and waits
+        for URL stability. Returns True if the click succeeded.
         """
         if not await self.wait_for_selector(selector, timeout):
             logger.warning("click: %r did not resolve within %.1fs", selector, timeout)
@@ -794,22 +801,58 @@ class Session:
             except Exception:
                 pass
 
-        js = f"""
+        rect_js = f"""
         (function() {{
             {self._RESOLVER_JS}
             var el = __rb_resolve({json.dumps(selector)});
-            if (!el) return false;
+            if (!el) return null;
             if (typeof el.scrollIntoView === 'function') {{
                 el.scrollIntoView({{block: 'center', inline: 'center'}});
             }}
-            el.click();
-            return true;
+            var r = el.getBoundingClientRect();
+            if (r.width <= 0 || r.height <= 0) return null;
+            return {{x: r.left + r.width / 2, y: r.top + r.height / 2}};
         }})()
         """
-        ok = await self.evaluate_bool(js) is True
-        if ok and wait_for_navigation and url_before:
+        clicked = False
+        try:
+            coords = await self.evaluate_value(rect_js)
+        except Exception:
+            coords = None
+        if isinstance(coords, dict) and isinstance(coords.get("x"), (int, float)):
+            clicked = await self._dispatch_mouse_click(
+                float(coords["x"]), float(coords["y"]),
+            )
+        if not clicked:
+            # Fallback: synthetic DOM click (untrusted). Some frameworks
+            # accept it; a hidden/zero-size element only works this way.
+            js = f"""
+            (function() {{
+                {self._RESOLVER_JS}
+                var el = __rb_resolve({json.dumps(selector)});
+                if (!el) return false;
+                if (typeof el.scrollIntoView === 'function') {{
+                    el.scrollIntoView({{block: 'center', inline: 'center'}});
+                }}
+                el.click();
+                return true;
+            }})()
+            """
+            clicked = await self.evaluate_bool(js) is True
+        if clicked and wait_for_navigation and url_before:
             await self._wait_for_url_stability(url_before)
-        return ok
+        return clicked
+
+    async def _dispatch_mouse_click(self, x: float, y: float) -> bool:
+        """Dispatch a trusted (CDP Input) left-click at viewport coordinates."""
+        base = {"button": "left", "clickCount": 1, "x": x, "y": y}
+        try:
+            await self._cdp.send("Input.dispatchMouseEvent", {**base, "type": "mousePressed"})
+            await self._cdp.send("Input.dispatchMouseEvent", {**base, "type": "mouseReleased"})
+            return True
+        except Exception as exc:
+            logger.debug("Trusted mouse dispatch unavailable (%s); using synthetic click", exc)
+            return False
 
     async def fill(self, selector: str, value: str, timeout: float = 5.0) -> bool:
         """Fill an input, textarea, select or contenteditable with *value*.

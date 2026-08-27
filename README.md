@@ -39,6 +39,27 @@ The snapshot combines the CDP accessibility tree with DOM/ARIA enrichment,
 including roles, accessible names, disabled/checked state, and selectors where
 available.
 
+## Trusted clicks and promise-aware evaluation
+
+`Session.click` now dispatches a **trusted** CDP `Input.dispatchMouseEvent` at
+the element's center — React/Vue router buttons that ignore synthetic
+`el.click()` dispatches respond to these. A synthetic-click fallback remains
+for hidden or zero-size elements.
+
+`evaluate`/`evaluate_value` now set `awaitPromise`, so expressions like
+`fetch('/api').then(r => r.text())` resolve to the final body instead of an
+opaque `{}` — no store-then-read workaround needed.
+
+## Stealth diagnostics
+
+`ricibrowser.stealth_benchmark` provides a defensive, local consistency
+benchmark for an operator-owned fixture page. It checks observable signals such
+as `navigator.webdriver`, user-agent/client-hint consistency, locale/timezone,
+WebGL, canvas/audio stability, plugins, CDP artifacts, and TLS consistency when
+the fixture supplies them. The score is a debugging heuristic, not a promise of
+invisibility or a vendor bot-detector result. It does not probe third-party
+anti-bot systems or attempt to evade them.
+
 ```python
 import asyncio
 from ricibrowser import Engine, EngineConfig
