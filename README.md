@@ -39,6 +39,13 @@ The snapshot combines the CDP accessibility tree with DOM/ARIA enrichment,
 including roles, accessible names, disabled/checked state, and selectors where
 available.
 
+## JavaScript exception surfacing
+
+`Runtime.evaluate` responses now carry CDP `exceptionDetails` through
+`session.last_eval_error` — a thrown expression returns `None` **with the
+actual JS exception text** instead of an unexplained null, so callers can
+distinguish "expression threw" from "returned undefined".
+
 ## Trusted clicks and promise-aware evaluation
 
 `Session.click` now dispatches a **trusted** CDP `Input.dispatchMouseEvent` at

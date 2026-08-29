@@ -104,6 +104,9 @@ class Session:
         self._navigation_id: int = 0
         self._snapshot_id: str = ""
         self._snapshot_refs: dict[str, dict[str, Any]] = {}
+        # Last JS evaluation exception (None when the last evaluate succeeded).
+        # Lets callers distinguish "expression threw" from "returned undefined".
+        self._last_eval_error: str | None = None
         # Register for frame navigation events so we invalidate the isolated
         # context when the frame changes (link clicks, SPA navigations, etc.).
         self._setup_frame_listener()
@@ -484,6 +487,11 @@ class Session:
         """
         return await self.evaluate_value(expression)
 
+    @property
+    def last_eval_error(self) -> str | None:
+        """The exception text from the most recent evaluate, if it threw."""
+        return self._last_eval_error
+
     async def capture_storage(self) -> tuple[str, dict[str, str]]:
         result = await self.evaluate_value("""({
           origin: location.origin,
@@ -531,6 +539,21 @@ class Session:
 
         try:
             result = await self._cdp.send("Runtime.evaluate", params)
+            # Surface JS exceptions: CDP returns exceptionDetails alongside a
+            # null value when the expression throws. Swallowing it made every
+            # JS error an unexplained None — the agent's top browse struggle.
+            exception = result.get("exceptionDetails")
+            if exception:
+                details = exception.get("exception") or {}
+                text = str(
+                    details.get("description")
+                    or details.get("value")
+                    or exception.get("text")
+                    or "JavaScript evaluation threw"
+                )[:500]
+                self._last_eval_error = text
+                return None
+            self._last_eval_error = None
             return result.get("result", {}).get("value")
         except CDPError as exc:
             # If the contextId was stale (frame changed underneath us), try a
