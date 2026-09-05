@@ -57,8 +57,9 @@ class CDPClient:
     which discovers targets via the HTTP /json API first.
     """
 
-    def __init__(self, ws: websockets.WebSocketClientProtocol):
+    def __init__(self, ws: websockets.WebSocketClientProtocol, command_timeout: float = 15.0):
         self._ws = ws
+        self._command_timeout = max(2.0, float(command_timeout))
         self._msg_id: int = 0
         self._pending: dict[int, asyncio.Future[dict]] = {}
         self._event_handlers: dict[str, list[CDPEventCallback]] = {}
@@ -71,14 +72,14 @@ class CDPClient:
         return self._closed
 
     @classmethod
-    async def connect(cls, ws_url: str) -> "CDPClient":
+    async def connect(cls, ws_url: str, command_timeout: float = 15.0) -> "CDPClient":
         """Connect directly to a CDP WebSocket endpoint.
 
         For Lightpanda: ws_url = "ws://127.0.0.1:9222"
         For Chrome: ws_url = "ws://127.0.0.1:9223/devtools/page/<target_id>"
         """
         ws = await ws_connect(ws_url, max_size=50 * 1024 * 1024)  # 50 MB max
-        client = cls(ws)
+        client = cls(ws, command_timeout=command_timeout)
         client._recv_task = asyncio.create_task(client._recv_loop())
         return client
 
@@ -87,6 +88,7 @@ class CDPClient:
         cls,
         http_url: str,
         target_id: str | None = None,
+        command_timeout: float = 15.0,
     ) -> "CDPClient":
         """Connect to a Chrome CDP target discovered via the HTTP /json API.
 
@@ -132,7 +134,7 @@ class CDPClient:
         if not ws_url:
             raise CDPError("connect_to_target", -1, "Target has no webSocketDebuggerUrl")
 
-        return await cls.connect(ws_url)
+        return await cls.connect(ws_url, command_timeout=command_timeout)
 
     async def send(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         """Send a CDP command and await the response.
@@ -166,11 +168,20 @@ class CDPClient:
             raise CDPError(method, -1, f"WebSocket send failed: {exc}") from exc
 
         try:
-            result = await asyncio.wait_for(future, timeout=120.0)
+            result = await asyncio.wait_for(future, timeout=self._command_timeout)
             return result
         except asyncio.TimeoutError:
             self._pending.pop(msg_id, None)
-            raise CDPError(method, -1, f"Timeout waiting for response to {method}")
+            # A command timeout means the transport is no longer trustworthy.
+            # Retire it immediately so callers cannot queue more commands on
+            # a half-open websocket; the owning Engine will create a clean
+            # session on the next attempt.
+            await self.close()
+            raise CDPError(
+                method, -1,
+                f"Timeout waiting {self._command_timeout:.1f}s for response to {method}; "
+                "CDP connection retired",
+            )
 
     async def on_event(self, event_name: str, callback: CDPEventCallback) -> None:
         """Register a callback for a CDP event (e.g. "Page.loadEventFired").

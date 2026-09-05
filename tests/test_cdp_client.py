@@ -32,6 +32,31 @@ async def test_cdp_client_send_closed_raises():
 
 
 @pytest.mark.asyncio
+async def test_cdp_command_timeout_retires_connection():
+    """A missing CDP response must fail fast and poison the transport.
+
+    Before the fix send() waited 120 seconds and left the websocket marked
+    open, so the browser runtime reused a dead session and every subsequent
+    browse call stalled too.
+    """
+
+    class _WS:
+        async def send(self, _payload):
+            return None
+
+        async def close(self):
+            return None
+
+    client = CDPClient(_WS(), command_timeout=0.02)
+    client._recv_task = None
+    with pytest.raises(CDPError) as exc_info:
+        await client.send("Page.enable")
+    assert "Timeout waiting" in exc_info.value.message
+    assert "Page.enable" in exc_info.value.message
+    assert client.is_closed is True
+
+
+@pytest.mark.asyncio
 async def test_cdp_event_registration():
     """Event callbacks can be registered without error."""
     client = CDPClient.__new__(CDPClient)

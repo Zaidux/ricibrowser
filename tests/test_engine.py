@@ -21,6 +21,11 @@ class TestEngineConfig:
         assert config.chrome_debug_port == 0
         assert config.debug_network is False
         assert config.stealth is True
+        assert config.cdp_command_timeout == 15.0
+
+    def test_cdp_command_timeout_is_clamped(self):
+        assert EngineConfig(cdp_command_timeout=0.1).cdp_command_timeout == 2.0
+        assert EngineConfig(cdp_command_timeout=999).cdp_command_timeout == 120.0
 
     def test_explicit_debug_port_is_respected(self):
         config = EngineConfig(chrome_debug_port=9223)

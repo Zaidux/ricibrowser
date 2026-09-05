@@ -152,7 +152,11 @@ class Session:
                 await self._cdp.send("Page.enable")
                 self._page_enabled = True
             except CDPError:
-                pass
+                # Page.enable is required for navigation/load events. The old
+                # code swallowed every error and continued, causing a second
+                # doomed command and a multi-minute outer timeout. Optional
+                # domains (Network, extensions) may degrade; Page may not.
+                raise
 
     async def _refresh_main_frame_id(self) -> str:
         """Look up the current top-level frame id via Page.getFrameTree.

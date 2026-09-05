@@ -113,6 +113,25 @@ async def test_navigate_reports_hard_error_text():
 
 
 @pytest.mark.asyncio
+async def test_page_enable_error_propagates_before_navigation():
+    """Page.enable is foundational; swallowing its error caused a second
+    doomed command and a multi-minute outer timeout in the CLI browser tool."""
+    from ricibrowser.cdp_client import CDPError
+
+    class Client:
+        def __init__(self):
+            self._event_handlers = {}
+
+        async def send(self, method, params=None):
+            assert method == "Page.enable"
+            raise CDPError(method, -1, "connection retired")
+
+    session = Session(Client(), "cdp_chrome")
+    with pytest.raises(CDPError, match="connection retired"):
+        await session.navigate("http://example.test/", wait_until="load")
+
+
+@pytest.mark.asyncio
 async def test_navigate_falls_back_when_load_event_never_fires():
     """If the load event never arrives, navigate falls back to the readyState
     poll after nav_timeout instead of hanging forever."""

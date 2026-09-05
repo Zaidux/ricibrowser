@@ -289,7 +289,9 @@ class Engine:
     async def _browse_chrome(self, url: str, max_chars: int, **kwargs) -> Page:
         """Browse via CDP-Chrome (thorough path)."""
         debug_url = await self._ensure_chrome()
-        client = await CDPClient.connect_to_target(debug_url)
+        client = await CDPClient.connect_to_target(
+            debug_url, command_timeout=self.config.cdp_command_timeout,
+        )
         try:
             session = Session(client, engine_name="cdp_chrome")
             session._url_stability_timeout = self.config.url_stability_timeout
@@ -335,7 +337,9 @@ class Engine:
     async def _create_chrome_session(self) -> Session:
         """Create a persistent session via CDP-Chrome with all extensions applied."""
         debug_url = await self._ensure_chrome()
-        client = await CDPClient.connect_to_target(debug_url)
+        client = await CDPClient.connect_to_target(
+            debug_url, command_timeout=self.config.cdp_command_timeout,
+        )
         session = Session(client, engine_name="cdp_chrome")
         session._url_stability_timeout = self.config.url_stability_timeout
         session._nav_timeout = self.config.nav_timeout

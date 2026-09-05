@@ -94,12 +94,22 @@ class EngineConfig:
     """Max seconds to wait for the Page.loadEventFired signal after Page.navigate."""
     chrome_startup_timeout: float = 20.0
     """Max seconds to wait for Chrome's CDP endpoint to become reachable after launch."""
+    cdp_command_timeout: float = 15.0
+    """Max seconds for an individual CDP command response.
+
+    CDP commands such as Page.enable, Network.enable, and Runtime.evaluate
+    should answer promptly. A 120-second hardcoded wait let a poisoned
+    websocket stall the whole browser pipeline for minutes; navigation has
+    its own longer page-load deadline.
+    """
 
     def __post_init__(self) -> None:
         if isinstance(self.fast_engine, str):
             self.fast_engine = EngineType(self.fast_engine)
         if isinstance(self.thorough_engine, str):
             self.thorough_engine = EngineType(self.thorough_engine)
+
+        self.cdp_command_timeout = max(2.0, min(float(self.cdp_command_timeout), 120.0))
 
         # When routing through a proxy, bump the navigation timeout to
         # account for per-flow proxy overhead on asset-heavy SPAs.
