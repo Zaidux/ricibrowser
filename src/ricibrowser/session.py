@@ -929,6 +929,209 @@ class Session:
             return False
         return True
 
+    # ── Form-state harvest / restore ─────────────────────────────────
+    #
+    # Long interact sequences die mid-form (timeouts, CDP hiccups, hard
+    # navigations) and the filled values die with the page. These two
+    # methods make that state capturable and replayable: harvest reads
+    # every programmatically re-fillable field on the page in ONE
+    # evaluate round-trip; restore re-applies a field list through the
+    # same fill machinery (label resolver + framework event dispatch +
+    # verification) the caller used originally.
+
+    _FORM_HARVEST_JS = """
+    (function() {
+        function selFor(el) {
+            try {
+                if (el.id) {
+                    var byId = '#' + CSS.escape(el.id);
+                    if (document.querySelectorAll(byId).length === 1) return byId;
+                }
+                var n = el.getAttribute('name');
+                if (n) {
+                    var byName = el.tagName.toLowerCase() + '[name=' + JSON.stringify(n) + ']';
+                    if (document.querySelectorAll(byName).length === 1) return byName;
+                }
+                // Uniqueness matters as much here as for id/name: two fields
+                // sharing a placeholder would produce identical selectors and
+                // silently restore into the first one twice.
+                var al = el.getAttribute('aria-label');
+                if (al) {
+                    var byAria = '[aria-label=' + JSON.stringify(al) + ']';
+                    if (document.querySelectorAll(byAria).length === 1) return byAria;
+                }
+                var ph = el.getAttribute('placeholder');
+                if (ph) {
+                    var byPh = '[placeholder=' + JSON.stringify(ph) + ']';
+                    if (document.querySelectorAll(byPh).length === 1) return byPh;
+                }
+            } catch (e) { return null; }
+            return null;  // not reliably re-targetable
+        }
+        var out = [];
+        var els = document.querySelectorAll(
+            'input, textarea, select, [contenteditable="true"]');
+        for (var i = 0; i < els.length && out.length < 60; i++) {
+            var el = els[i];
+            var tag = el.tagName.toLowerCase();
+            var type = (el.getAttribute('type') || (tag === 'input' ? 'text' : tag)).toLowerCase();
+            if (type === 'file' || type === 'hidden' || el.disabled) continue;
+            // Button-ish inputs carry labels, not data — restoring them is
+            // meaningless noise (and clicking them is what got us here).
+            if (type === 'submit' || type === 'reset' || type === 'button' || type === 'image') continue;
+            var s = selFor(el);
+            if (!s) continue;
+            var rec = {selector: s, tag: tag, type: type};
+            if (type === 'checkbox' || type === 'radio') {
+                rec.checked = !!el.checked;
+                if (type === 'radio' && !el.checked) continue;  // only the chosen one matters
+            } else if (tag === 'select' && el.multiple) {
+                rec.multiple = true;
+                rec.value = JSON.stringify(
+                    Array.prototype.map.call(el.selectedOptions, function(o) { return o.value; })
+                );
+            } else {
+                rec.value = el.isContentEditable ? (el.textContent || '') : String(el.value != null ? el.value : '');
+            }
+            out.push(rec);
+        }
+        return out;
+    })()
+    """
+
+    async def snapshot_form_state(self) -> list[dict[str, Any]]:
+        """Harvest all re-fillable form fields on the current page.
+
+        Returns a list of ``{selector, value|checked, type, tag, multiple?}``
+        records suitable for :meth:`restore_form_state`. Fields that cannot
+        be re-targeted reliably (no unique id/name/aria-label/placeholder)
+        and file/hidden/button inputs are skipped by design; the harvest is
+        capped at 60 records. Note: password fields ARE captured — the
+        store is local to the operator's workspace, same as the cookie jar.
+        """
+        try:
+            rows = await self.evaluate_value(self._FORM_HARVEST_JS)
+        except Exception as exc:
+            logger.debug("form-state harvest failed: %s", exc)
+            return []
+        if not isinstance(rows, list):
+            return []
+        return [
+            row for row in rows
+            if isinstance(row, dict) and row.get("selector")
+        ]
+
+    async def restore_form_state(
+        self, fields: list[dict[str, Any]], timeout: float = 5.0,
+    ) -> list[dict[str, Any]]:
+        """Re-apply harvested/filled fields; returns per-field results.
+
+        Text-like fields go through :meth:`fill` (label resolution +
+        framework event dispatch + value verification). Checkboxes/radios
+        are toggled via a synthetic click; multi-selects select options
+        directly and dispatch change events. Every branch waits for its
+        element to mount first (up to *timeout*), matching fill()'s
+        behaviour on client-rendered pages. Malformed records (non-dict,
+        missing selector) are reported as failures rather than raised, so
+        one bad record can never abort the replay of the rest.
+        """
+        results: list[dict[str, Any]] = []
+        for rec in fields or []:
+            if not isinstance(rec, dict):
+                # Reached before any attribute access — a corrupted or
+                # older-format persisted record must not abort the replay.
+                results.append({"selector": "", "ok": False,
+                                "note": "malformed record (not an object)"})
+                continue
+            selector = str(rec.get("selector", ""))
+            ftype = str(rec.get("type", "")).lower()
+            ok = False
+            try:
+                if not selector:
+                    # Nothing to target — report rather than raise, so one
+                    # malformed record can't abort the rest of the replay.
+                    entry = {"selector": "", "ok": False,
+                             "note": "record has no selector"}
+                    if ftype:
+                        entry["type"] = ftype
+                    results.append(entry)
+                    continue
+                if ftype in ("checkbox", "radio"):
+                    # Same mount-wait fill() gets: SPA controls render late,
+                    # and restore-after-navigation is this feature's main use.
+                    if not await self.wait_for_selector(selector, timeout):
+                        results.append({"selector": selector, "ok": False,
+                                        "type": ftype,
+                                        "note": "element did not mount in time"})
+                        continue
+                    want = bool(rec.get("checked"))
+                    js = f"""
+                    (function() {{
+                        {self._RESOLVER_JS}
+                        var el = __rb_resolve({json.dumps(selector)});
+                        if (!el) return false;
+                        if (!!el.checked !== {json.dumps(want)}) el.click();
+                        return !!el.checked === {json.dumps(want)};
+                    }})()
+                    """
+                    ok = await self.evaluate_bool(js) is True
+                elif rec.get("multiple"):
+                    if not await self.wait_for_selector(selector, timeout):
+                        entry = {"selector": selector, "ok": False,
+                                 "note": "element did not mount in time"}
+                        if ftype:
+                            entry["type"] = ftype
+                        results.append(entry)
+                        continue
+                    raw_val = rec.get("value")
+                    if isinstance(raw_val, list):
+                        values = [str(v) for v in raw_val]
+                    else:
+                        try:
+                            values = json.loads(str(raw_val or "[]"))
+                        except (ValueError, TypeError):
+                            # An unparseable stored value must never CLEAR
+                            # the live selection — leave the field untouched.
+                            entry = {"selector": selector, "ok": False,
+                                     "note": "stored value unparseable; left untouched"}
+                            if ftype:
+                                entry["type"] = ftype
+                            results.append(entry)
+                            continue
+                    js = f"""
+                    (function() {{
+                        {self._RESOLVER_JS}
+                        var el = __rb_resolve({json.dumps(selector)});
+                        if (!el) return false;
+                        var want = {json.dumps(values)};
+                        for (var i = 0; i < el.options.length; i++) {{
+                            el.options[i].selected = want.indexOf(el.options[i].value) !== -1;
+                        }}
+                        el.dispatchEvent(new Event('input', {{bubbles: true}}));
+                        el.dispatchEvent(new Event('change', {{bubbles: true}}));
+                        return true;
+                    }})()
+                    """
+                    ok = await self.evaluate_bool(js) is True
+                else:
+                    ok = await self.fill(
+                        selector, str(rec.get("value", "")), timeout=timeout,
+                    )
+            except Exception:
+                ok = False
+            entry = {"selector": selector, "ok": ok}
+            if ftype:
+                entry["type"] = ftype
+            if not ok and ftype == "file":
+                entry["note"] = "file inputs cannot be re-filled programmatically"
+            if not ok:
+                logger.debug(
+                    "restore_form_state: %r (type=%s) did not re-apply",
+                    selector, ftype or "?",
+                )
+            results.append(entry)
+        return results
+
     async def _wait_for_url_stability(self, url_before: str) -> None:
         """Poll location.href until the URL stops changing or times out.
 
