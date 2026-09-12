@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ricibrowser"
-version = "0.2.26"
+version = "0.2.27"
 description = "A lightweight two-engine browser automation module built on CDP — no Playwright, no Puppeteer"
 readme = "README.md"
 license = "MIT"
@@ -27,6 +27,7 @@ dependencies = [
     "websockets>=15.0.1,<16",
     "httpx>=0.28.1,<1",
     "aiofiles>=25.1.0,<26",
+    "pillow>=10.0.0",
 ]
 
 [project.optional-dependencies]

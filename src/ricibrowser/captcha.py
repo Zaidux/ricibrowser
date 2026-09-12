@@ -28,10 +28,13 @@ Usage::
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
 import json
 import logging
+import random
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Protocol, runtime_checkable
 
@@ -61,6 +64,10 @@ class CaptchaType(Enum):
     HCAPTCHA = "hcaptcha"
     """hCaptcha widget. Needs external solver."""
 
+    SLIDER = "slider"
+    """Drag-the-handle slider puzzle (Aliyun/geetest-style). Solved
+    in-engine: gap detection + trusted human-like drag."""
+
     GENERIC = "generic"
     """Unknown anti-bot challenge."""
 
@@ -77,6 +84,8 @@ class CaptchaResult:
     """Which solver was used (e.g. 'cloudflare_auto', 'external')."""
     error: str | None = None
     duration_seconds: float = 0.0
+    detail: dict = field(default_factory=dict)
+    """Solver-specific diagnostics (attempts, detected gap offset, ...)."""
 
 
 @runtime_checkable
@@ -182,6 +191,13 @@ async def detect_captcha(session) -> CaptchaType:
     if hcaptcha:
         return CaptchaType.HCAPTCHA
 
+    # Slider puzzle (Aliyun/geetest-style): a drag handle next to a puzzle
+    # image. Checked before the generic text probe because the widget is
+    # often present without any challenge message in the body text.
+    slider = await session.evaluate_bool(_SLIDER_PRESENT_JS)
+    if slider:
+        return CaptchaType.SLIDER
+
     # Generic anti-bot check
     if any(p in text_lower for p in(
         "enable javascript and cookies", "please complete the security check",
@@ -190,6 +206,354 @@ async def detect_captcha(session) -> CaptchaType:
         return CaptchaType.GENERIC
 
     return CaptchaType.NONE
+
+
+# ── Slider puzzle solver (Aliyun / geetest style) ─────────────────────
+
+# Common widget roots and handle selectors across the major slider CAPTCHAs.
+_SLIDER_HANDLE_SELECTORS = (
+    ".nc_iconfont", "#nc_1_n1z", ".nc-container .btn_slide",
+    ".geetest_slider_button", ".geetest_slide", ".verify-move-block",
+    "[class*='slider-btn']", "[class*='sliderBtn']", "[class*='slide-btn']",
+    "[class*='slideBlock']", "[class*='sliderIcon']",
+)
+_SLIDER_CONTAINER_SELECTORS = (
+    ".nc-container", ".nc_wrapper", ".geetest_holder", ".geetest_panel",
+    "[class*='slide-verify']", "[class*='sliderCaptcha']", "[class*='slider-captcha']",
+)
+_SLIDER_TEXT_HINTS = (
+    "drag to complete the puzzle", "drag the slider", "slide to verify",
+    "swipe to verify", "slide right", "拖动滑块", "按住滑块", "请完成安全验证",
+    "滑动验证", "向右滑动", "完成拼图",
+)
+
+_SLIDER_PRESENT_JS = """
+(function() {
+    // Known captcha signatures are trusted outright — these class names
+    // only exist on Aliyun/geetest widgets, never on plain UI sliders.
+    var known = ['.nc-container', '.nc_wrapper', '.nc_iconfont',
+                 '.geetest_holder', '.geetest_panel', '.geetest_slider_button',
+                 '#nc_1_n1z'];
+    for (var i = 0; i < known.length; i++) {
+        if (document.querySelector(known[i])) return true;
+    }
+    // Body-text hints (zh + en) are strong signals on their own.
+    var text = (document.body ? document.body.innerText : '').toLowerCase();
+    var hints = %s;
+    for (var h = 0; h < hints.length; h++) {
+        if (text.indexOf(hints[h]) !== -1) return true;
+    }
+    // Generic slider-looking containers only count when their own label
+    // reads like a challenge — otherwise a plain range-slider UI component
+    // would be mistaken for a captcha (and dragged!).
+    var generic = ["[class*='slide-verify']", "[class*='sliderCaptcha']",
+                   "[class*='slider-captcha']", "[class*='slider-canvas']"];
+    for (var g = 0; g < generic.length; g++) {
+        var el = document.querySelector(generic[g]);
+        if (!el) continue;
+        var t = (el.innerText || '').toLowerCase();
+        var labels = ['验证', 'verify', '拖', 'drag', 'slide', 'puzzle',
+                      'security', '安全'];
+        for (var l = 0; l < labels.length; l++) {
+            if (t.indexOf(labels[l]) !== -1) return true;
+        }
+    }
+    return false;
+})()
+""" % json.dumps(list(_SLIDER_TEXT_HINTS))
+
+
+def find_gap_offset(
+    image_bytes: bytes,
+    handle_center_x: float,
+    min_ratio: float = 0.25,
+) -> tuple[float | None, dict]:
+    """Locate the puzzle notch in a slider background image.
+
+    Pure function (unit-testable): column-edge-energy heuristic — the notch
+    has strong vertical edges, so summing per-column intensity deltas and
+    taking the strongest peak right of the handle's start gives the gap.
+    Returns ``(dx, info)`` where dx is the horizontal drag distance from the
+    handle's centre, or ``(None, info)`` when the image can't be analysed.
+    """
+    info: dict = {}
+    try:
+        from PIL import Image
+    except Exception:  # pragma: no cover - Pillow is a declared dependency
+        return None, {"error": "Pillow unavailable for gap analysis"}
+    try:
+        img = Image.open(io.BytesIO(image_bytes)).convert("L")
+    except Exception as exc:
+        return None, {"error": f"cannot decode capture: {exc}"}
+    w, h = img.size
+    info["image_width"] = w
+    info["image_height"] = h
+    if w < 20 or h < 10:
+        return None, {**info, "error": "capture too small"}
+    px = img.load()
+    profile: list[int] = []
+    for x in range(1, w):
+        energy = 0
+        for y in range(0, h, 2):
+            d = px[x, y] - px[x - 1, y]
+            energy += d if d >= 0 else -d
+        profile.append(energy)
+    start = int(w * min_ratio)
+    if start >= len(profile) - 1:
+        start = 1
+    peak_index = max(range(start, len(profile)), key=lambda i: profile[i])
+    peak_x = peak_index + 1
+    info["peak_x"] = peak_x
+    info["peak_energy"] = int(profile[peak_index])
+    info["profile_avg"] = int(sum(profile) / max(1, len(profile)))
+    dx = float(peak_x) - float(handle_center_x)
+    return dx, info
+
+
+async def _capture_clip(session, rect: dict[str, float]) -> bytes | None:
+    """Screenshot a page region via CDP (no navigation, no canvas taint issues)."""
+    cdp = getattr(session, "_cdp", None)
+    if cdp is None:
+        return None
+    try:
+        result = await cdp.send("Page.captureScreenshot", {
+            "format": "png",
+            "clip": {
+                "x": max(0.0, float(rect.get("x", 0))),
+                "y": max(0.0, float(rect.get("y", 0))),
+                "width": max(1.0, float(rect.get("width", 1))),
+                "height": max(1.0, float(rect.get("height", 1))),
+                "scale": 1,
+            },
+            "captureBeyondViewport": False,
+        })
+    except Exception as exc:
+        logger.debug("slider capture failed: %s", exc)
+        return None
+    data = (result or {}).get("data") if isinstance(result, dict) else None
+    if not data:
+        return None
+    try:
+        return base64.b64decode(data)
+    except Exception:
+        return None
+
+
+_SLIDER_GEOMETRY_JS = f"""
+(function() {{
+    var handleSels = {json.dumps(list(_SLIDER_HANDLE_SELECTORS))};
+    var rootSels = {json.dumps(list(_SLIDER_CONTAINER_SELECTORS))};
+    var handle = null;
+    for (var i = 0; i < handleSels.length; i++) {{
+        var el = document.querySelector(handleSels[i]);
+        if (el) {{
+            var r = el.getBoundingClientRect();
+            if (r.width > 0 && r.height > 0) {{ handle = el; break; }}
+        }}
+    }}
+    if (!handle) return JSON.stringify(null);
+    // Bring the whole widget into the viewport BEFORE measuring: the
+    // background is captured via a CDP viewport clip, so an off-screen
+    // widget would screenshot the wrong region of the page.
+    if (typeof handle.scrollIntoView === 'function') {{
+        handle.scrollIntoView({{block: 'center', inline: 'nearest'}});
+    }}
+    // Tag the handle so the mouse layer gets a stable, unique selector.
+    handle.setAttribute('data-riciplay-slider', '1');
+    var hr = handle.getBoundingClientRect();
+    // Track: nearest ancestor wide enough to be the slider rail.
+    var track = handle.parentElement, guard = 0;
+    while (track && guard++ < 6) {{
+        var tr = track.getBoundingClientRect();
+        if (tr.width > hr.width * 2) break;
+        track = track.parentElement;
+    }}
+    if (!track) track = handle.parentElement || handle;
+    var trr = track.getBoundingClientRect();
+    // Puzzle image: largest img/canvas inside the widget root, else the
+    // region of the track above the handle (the classic stacked layout).
+    var root = null;
+    for (var j = 0; j < rootSels.length; j++) {{
+        var cand = document.querySelector(rootSels[j]);
+        if (cand && cand.contains(handle)) {{ root = cand; break; }}
+    }}
+    if (!root) root = track;
+    var rr = root.getBoundingClientRect();
+    var img = null, imgArea = 0;
+    var media = root.querySelectorAll('img, canvas');
+    for (var m = 0; m < media.length; m++) {{
+        var mr = media[m].getBoundingClientRect();
+        var area = mr.width * mr.height;
+        if (area > imgArea && mr.width > 20 && mr.height > 20) {{ img = media[m]; imgArea = area; }}
+    }}
+    var ir = img ? img.getBoundingClientRect() : {{
+        x: rr.x, y: rr.y, width: rr.width, top: rr.y,
+        height: Math.max(10, calcTop(rr, hr)),
+    }};
+    function calcTop(rr2, hr2) {{
+        var above = hr2.y - rr2.y;
+        return above > 10 ? above : rr2.height;
+    }}
+    return JSON.stringify({{
+        handle_selector: '[data-riciplay-slider="1"]',
+        handle: {{x: hr.x, y: hr.y, width: hr.width, height: hr.height}},
+        track: {{x: trr.x, y: trr.y, width: trr.width, height: trr.height}},
+        image: {{x: ir.x, y: ir.y, width: ir.width, height: ir.height}},
+        root: {{x: rr.x, y: rr.y, width: rr.width, height: rr.height}},
+    }});
+}})()
+"""
+
+_SLIDER_STATE_JS = """
+(function() {
+    // Success detection, strongest signal first:
+    //   1. widget removed from the document or zero-sized
+    //   2. the WIDGET's own text reads solved (scoped — never scan the
+    //      whole body, where 'success' as a substring matches
+    //      'unsuccessful' and any unrelated success message)
+    var roots = ['.nc-container', '.geetest_slider', '[class*="slide-verify"]',
+                 '[class*="sliderCaptcha"]', '[class*="slider-captcha"]',
+                 '.geetest_holder'];
+    var widget = null;
+    for (var j = 0; j < roots.length; j++) {
+        var el = document.querySelector(roots[j]);
+        if (el) { widget = el; break; }
+    }
+    if (!widget) return 'success';
+    if (!widget.isConnected) return 'success';
+    var wr = widget.getBoundingClientRect();
+    if (wr.width === 0 && wr.height === 0) return 'success';
+    var t = (widget.innerText || '').toLowerCase();
+    var ok = ['验证通过', '验证成功', '通过验证', '安全验证通过',
+              'verified', 'verification complete'];
+    for (var i = 0; i < ok.length; i++) {
+        if (t.indexOf(ok[i]) !== -1) return 'success';
+    }
+    return 'pending';
+})()
+"""
+
+
+async def _resolve_slider(session) -> dict | None:
+    try:
+        raw = await session.evaluate(_SLIDER_GEOMETRY_JS)
+    except Exception as exc:
+        logger.debug("slider geometry resolve failed: %s", exc)
+        return None
+    if not raw:
+        return None
+    try:
+        geo = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(geo, dict) or "handle" not in geo:
+        return None
+    return geo
+
+
+class SliderCaptchaSolver:
+    """Solves drag-handle slider puzzles (Aliyun/geetest-style) in-engine.
+
+    Pipeline:
+      1. Resolve the handle + track + puzzle-image geometry from the DOM.
+      2. Screenshot the puzzle via CDP ``Page.captureScreenshot`` with a clip
+         (no navigation, and no canvas-taint/CORS problems that broke the
+         in-page image reads).
+      3. Edge-energy gap detection (pure function) for the drag distance.
+      4. Trusted human-like drag through ``HumanMouse`` — the same
+         ``Input.dispatchMouseEvent`` channel a real user drives, so bot
+         heuristics see natural motion.
+      5. Verify success and retry with jitter when the target rejects.
+    """
+
+    def __init__(self, attempts: int = 3, settle_s: float = 0.6):
+        self.attempts = max(1, attempts)
+        self.settle_s = settle_s
+
+    async def solve(self, session) -> CaptchaResult:
+        start = time.monotonic()
+
+        from ricibrowser.input import HumanMouse
+
+        cdp = getattr(session, "_cdp", None)
+        mouse = HumanMouse(cdp) if cdp is not None else None
+        if mouse is None:
+            return CaptchaResult(
+                captcha_type=CaptchaType.SLIDER, solved=False,
+                error="Slider solving needs the trusted-input mouse (CDP engine); "
+                      "the active session has no CDP channel.",
+                duration_seconds=time.monotonic() - start,
+            )
+
+        last_detail: dict = {}
+        for attempt in range(self.attempts):
+            geo = await _resolve_slider(session)
+            if geo is None:
+                return CaptchaResult(
+                    captcha_type=CaptchaType.SLIDER, solved=False,
+                    error="No slider widget found on the current page.",
+                    detail=last_detail,
+                    duration_seconds=time.monotonic() - start,
+                )
+
+            handle = geo["handle"]
+            container = geo.get("root") or geo.get("track") or handle
+            image_rect = geo.get("image") or container
+            handle_center_x = (
+                handle["x"] + handle["width"] / 2.0 - image_rect["x"]
+            )
+
+            image = await _capture_clip(session, image_rect)
+            dx: float | None = None
+            gap_info: dict = {}
+            if image:
+                dx, gap_info = find_gap_offset(image, handle_center_x)
+            if dx is None:
+                return CaptchaResult(
+                    captcha_type=CaptchaType.SLIDER, solved=False,
+                    error=f"Could not analyse the slider image: {gap_info.get('error', 'capture unavailable')}",
+                    detail={"attempt": attempt + 1, **gap_info},
+                    duration_seconds=time.monotonic() - start,
+                )
+
+            # Keep the drag inside the rail; jitter retries for calibration.
+            max_dx = max(4.0, float(geo["track"]["width"]) - float(handle["width"]))
+            dx = max(4.0, min(float(dx), max_dx))
+            if attempt:
+                dx = max(4.0, min(dx + random.uniform(-10, 10), max_dx))
+
+            last_detail = {
+                "attempt": attempt + 1,
+                "drag_dx": round(dx, 1),
+                "handle_center_x": round(handle_center_x, 1),
+                **gap_info,
+            }
+            logger.info("Slider attempt %d: dragging dx=%.1f", attempt + 1, dx)
+
+            ok = await mouse.drag_element(
+                session, geo["handle_selector"], dx=dx, dy=0.0,
+            )
+            if not ok:
+                last_detail["error"] = "drag dispatch failed"
+                continue
+
+            await asyncio.sleep(self.settle_s)
+            state = await session.evaluate(_SLIDER_STATE_JS)
+            last_detail["state"] = state
+            if state == "success":
+                return CaptchaResult(
+                    captcha_type=CaptchaType.SLIDER, solved=True,
+                    solver_used="slider_gap_analysis",
+                    detail=last_detail,
+                    duration_seconds=time.monotonic() - start,
+                )
+
+        return CaptchaResult(
+            captcha_type=CaptchaType.SLIDER, solved=False,
+            error=f"Slider verification did not pass after {self.attempts} attempt(s).",
+            detail=last_detail,
+            duration_seconds=time.monotonic() - start,
+        )
 
 
 # ── Cloudflare Auto-Solver ────────────────────────────────────────────
@@ -315,9 +679,11 @@ class CaptchaHandler:
         self,
         auto_solver: CloudflareAutoSolver | None = None,
         external_solver: CaptchaSolver | None = None,
+        slider_solver: SliderCaptchaSolver | None = None,
     ):
         self.auto_solver = auto_solver or CloudflareAutoSolver()
         self.external_solver = external_solver
+        self.slider_solver = slider_solver or SliderCaptchaSolver()
 
     async def detect_and_solve(self, session) -> CaptchaResult:
         """Detect the CAPTCHA type and attempt resolution.
@@ -343,6 +709,10 @@ class CaptchaHandler:
         if captcha_type == CaptchaType.CLOUDFLARE_JS:
             result = await self.auto_solver.solve(session)
             return result
+
+        # ── Slider puzzle → in-engine gap analysis + trusted drag ──
+        if captcha_type == CaptchaType.SLIDER:
+            return await self.slider_solver.solve(session)
 
         # ── External solver for reCAPTCHA/hCaptcha/Turnstile ───────
         if self.external_solver and captcha_type in(
