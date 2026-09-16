@@ -746,6 +746,47 @@ class Session:
                 if (ref && match(ref.textContent)) return f;
             }
         }
+
+        // 4. Visible-text match on actionable elements.
+        //    "click Continue with Email" is the most natural instruction an
+        //    agent can write, but steps 1-3 only ever resolve FORM FIELDS —
+        //    so every button/link click by its label failed, and agents
+        //    burned rounds hunting for CSS selectors that didn't exist
+        //    (field session 4a2ac15c). Match buttons, links, tabs, menu
+        //    items and ARIA button/checkbox roles by their visible text.
+        //    Exact beats substring; the smallest match wins so a
+        //    page-wrapping <div> cannot shadow the real control; genuine
+        //    interactive tags get a bonus over role-carrying containers.
+        var ACTIONABLE = 'button, a, summary, [role="button"], [role="link"], '
+            + '[role="tab"], [role="menuitem"], [role="option"], [role="treeitem"], '
+            + '[role="switch"], [role="checkbox"], [role="radio"], '
+            + 'input[type="submit"], input[type="button"], input[type="reset"]';
+        var actionable = allWithShadow(ACTIONABLE);
+        var best = null, bestScore = -Infinity;
+        for (var k = 0; k < actionable.length; k++) {
+            var cand = actionable[k];
+            if (!visible(cand)) continue;
+            if (cand.disabled || cand.getAttribute('aria-disabled') === 'true') continue;
+            var label;
+            if ((cand.tagName || '').toLowerCase() === 'input') {
+                label = cand.value || cand.getAttribute('aria-label') || '';
+            } else {
+                label = cand.getAttribute('aria-label')
+                     || cand.innerText || cand.textContent || '';
+            }
+            label = String(label).trim();
+            if (!label) continue;
+            var low = label.toLowerCase();
+            var exact = low === needle;
+            if (!exact && !(needle.length > 2 && low.indexOf(needle) !== -1)) continue;
+            var score = (exact ? 100000 : 0) - label.length;
+            var tag = (cand.tagName || '').toLowerCase();
+            if (tag === 'button' || tag === 'a' || tag === 'summary') score += 10000;
+            if (cand.getAttribute('role')) score += 1000;
+            if (score > bestScore) { bestScore = score; best = cand; }
+        }
+        if (best) return best;
+
         return null;
     }
     """
@@ -767,6 +808,18 @@ class Session:
     # though properties do not. Verified against React 18.
     _SETTER_JS = """
     function __rb_setValue(el, value) {
+        // Refuse obviously non-fillable targets. The resolver now also
+        // matches buttons/links by visible text (for click), so a fill
+        // aimed at a button label would otherwise write .value, verify
+        // .value, and report a false success.
+        var _tag = (el.tagName || '').toLowerCase();
+        var _type = String((el.getAttribute && el.getAttribute('type')) || '').toLowerCase();
+        var _fillable = el.isContentEditable
+            || _tag === 'textarea' || _tag === 'select'
+            || (_tag === 'input'
+                && _type !== 'submit' && _type !== 'button'
+                && _type !== 'reset' && _type !== 'image' && _type !== 'file');
+        if (!_fillable) return false;
         var proto = Object.getPrototypeOf(el);
         var desc = Object.getOwnPropertyDescriptor(proto, 'value')
                 || Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
