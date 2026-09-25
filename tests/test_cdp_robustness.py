@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -216,3 +217,66 @@ async def test_wait_for_url_stability_detects_change():
     sess._url_stability_timeout = 5.0
     await sess._wait_for_url_stability("https://old.test/")
     assert sess._current_url == "https://new.test/"
+
+
+# ── 5. blocking Chrome shutdown must not stall the event loop ──
+
+
+@pytest.mark.asyncio
+async def test_engine_close_does_not_block_the_loop():
+    """stop_chrome() waits on a process; from async code that froze the loop.
+
+    A Chrome that ignores SIGTERM kept the loop blocked for the full
+    escalation window. Engine.close() must run it in an executor.
+    """
+    import os
+    import signal
+    import time as _t
+
+    import ricibrowser.engine as eng
+
+    # A child that refuses to die on SIGTERM. It announces readiness so the
+    # test cannot race the handler installation — without the handshake,
+    # close() can land before the child ignores SIGTERM and the stall never
+    # reproduces.
+    proc = subprocess.Popen(
+        ["python3", "-c",
+         "import signal,sys,time\n"
+         "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+         "sys.stdout.write('ready\\n'); sys.stdout.flush()\n"
+         "time.sleep(60)\n"],
+        preexec_fn=os.setsid,
+        stdout=subprocess.PIPE,
+    )
+    assert proc.stdout is not None
+    assert proc.stdout.readline().strip() == b"ready"
+    try:
+        ticks = 0
+        start = _t.monotonic()
+
+        async def ticker():
+            nonlocal ticks
+            while _t.monotonic() - start < 1.0:
+                ticks += 1
+                await asyncio.sleep(0.01)
+
+        engine = eng.Engine.__new__(eng.Engine)
+        engine._chrome_proc = proc
+        engine._temp_user_data_dir = None
+        engine._lightpanda = None
+
+        t = asyncio.create_task(ticker())
+        await engine.close()
+        await t
+        elapsed = _t.monotonic() - start
+
+        assert ticks > 20, f"loop starved during close(): only {ticks} ticks in {elapsed:.2f}s"
+    finally:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, OSError):
+            pass
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass

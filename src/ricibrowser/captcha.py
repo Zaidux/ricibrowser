@@ -733,16 +733,30 @@ class CaptchaHandler:
             try:
                 token = await self.external_solver.solve(captcha_type, site_key or None, url)
                 if token:
-                    # Inject the token into the page
-                    await session.evaluate(
-                        f"document.getElementById('g-recaptcha-response').value = {json.dumps(token)};"
-                        if captcha_type == CaptchaType.RECAPTCHA_V2 else
-                        f"window.__captcha_token__ = {json.dumps(token)};"
-                    )
+                    # Inject through each widget's real API. A single
+                    # `window.__captcha_token__` global is read by nobody —
+                    # Turnstile needs its callback, hCaptcha its own response
+                    # hook, v3 a grecaptcha.execute round-trip.
+                    await self._inject_token(session, captcha_type, token)
+                    # A token in hand is NOT a solved challenge: the widget
+                    # may not have accepted it, and reporting solved=True
+                    # here makes the caller continue against a still-blocked
+                    # page. Verify, exactly as the slider and Cloudflare
+                    # paths do, and report honestly either way.
+                    if await self._verify_external_cleared(session, captcha_type, token):
+                        return CaptchaResult(
+                            captcha_type=captcha_type,
+                            solved=True,
+                            solver_used="external",
+                            duration_seconds=time.monotonic() - start,
+                        )
                     return CaptchaResult(
                         captcha_type=captcha_type,
-                        solved=True,
-                        solver_used="external",
+                        solved=False,
+                        error=(
+                            "External solver returned a token but the widget did "
+                            "not accept it; the challenge is still present."
+                        ),
                         duration_seconds=time.monotonic() - start,
                     )
             except Exception as exc:
@@ -754,7 +768,92 @@ class CaptchaHandler:
                     duration_seconds=time.monotonic() - start,
                 )
 
-        # ── No solver available for this type ──────────────────────
+        # ── external-solver token injection + verification ───────────────
+
+    async def _inject_token(
+        self, session: Any, captcha_type: CaptchaType, token: str,
+    ) -> None:
+        """Hand the token to the widget using that widget's own API."""
+        tok = json.dumps(token)
+        if captcha_type == CaptchaType.RECAPTCHA_V2:
+            # The response textarea is what the form actually submits.
+            js = (
+                "var el=document.getElementById('g-recaptcha-response');"
+                f"if(el){{el.value={tok};"
+                "el.dispatchEvent(new Event('input',{bubbles:true}));"
+                "el.dispatchEvent(new Event('change',{bubbles:true}));}"
+                # v2 also mirrors the token onto the widget API.
+                "if(window.grecaptcha){try{window.grecaptcha.reset();}catch(e){}}"
+            )
+        elif captcha_type == CaptchaType.CLOUDFLARE_TURNSTILE:
+            # Turnstile hands the token to an onload callback.
+            js = (
+                f"window.__rb_token={tok};"
+                "var c=document.querySelector('.cf-turnstile-response,input[name='cf-turnstile-response']);"
+                f"if(c){{c.value={tok};}}"
+                "try{var cb=window.__rb_ts_callback||window.turnstileCallback;"
+                "if(typeof cb==='function'){cb({token:window.__rb_token});}}catch(e){}"
+            )
+        elif captcha_type == CaptchaType.HCAPTCHA:
+            js = (
+                f"window.__rb_token={tok};"
+                "var c=document.querySelector('.h-captcha-response,textarea[name='h-captcha-response']');"
+                f"if(c){{c.value={tok};}}"
+                "try{var cb=window.__rb_hc_callback||window.hcaptchaCallback;"
+                "if(typeof cb==='function'){cb(window.__rb_token);}}catch(e){}"
+            )
+        else:  # RECAPTCHA_V3 — execute and capture via the API
+            js = (
+                f"window.__rb_token={tok};"
+                "try{if(window.grecaptcha&&window.grecaptcha.execute){"
+                "window.grecaptcha.execute();}}catch(e){}"
+            )
+        await session.evaluate(js)
+
+    async def _verify_external_cleared(
+        self, session: Any, captcha_type: CaptchaType, token: str,
+    ) -> bool:
+        """Did the widget actually accept the token?
+
+        Polls a few times: acceptance can involve a round-trip. Returns
+        False on timeout so the caller reports an honest failure instead of
+        a success that never happened.
+        """
+        deadline = time.monotonic() + 5.0
+        selectors = {
+            CaptchaType.RECAPTCHA_V2: (
+                "#g-recaptcha, .g-recaptcha, iframe[src*='recaptcha']"
+            ),
+            CaptchaType.CLOUDFLARE_TURNSTILE: (
+                ".cf-turnstile, iframe[src*='challenges.cloudflare.com']"
+            ),
+            CaptchaType.HCAPTCHA: (
+                ".h-captcha, iframe[src*='hcaptcha']"
+            ),
+            CaptchaType.RECAPTCHA_V3: "iframe[src*='recaptcha']",
+        }.get(captcha_type, "iframe[src*='recaptcha']")
+
+        while time.monotonic() < deadline:
+            try:
+                state = await session.evaluate(
+                    "(function(s){"
+                    f"var sel={json.dumps(selectors)};"
+                    "if(!document.querySelector(sel)) return 'gone';"
+                    "var v=document.getElementById('g-recaptcha-response');"
+                    "if(v&&v.value&&v.value.length>20) return 'accepted';"
+                    "if(document.querySelector('.grecaptcha-badge')) return 'accepted';"
+                    "return 'present';"
+                    "})()"
+                )
+            except Exception:
+                await asyncio.sleep(self.poll_interval)
+                continue
+            if state in ("gone", "accepted"):
+                return True
+            await asyncio.sleep(self.poll_interval)
+        return False
+
+    # ── No solver available for this type ──────────────────────
         solver_name = "external" if self.external_solver else "none"
         return CaptchaResult(
             captcha_type=captcha_type,

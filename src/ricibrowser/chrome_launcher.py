@@ -200,15 +200,33 @@ def stop_chrome(proc: subprocess.Popen) -> None:
             except ProcessLookupError:
                 pass
     else:
-        # POSIX: kill the process group
+        # POSIX: kill the process group.
+        # NOTE: this is a *synchronous* helper — callers on the event loop
+        # must run it in an executor (Engine._ensure_chrome/close do).
+        # The waits are bounded so a Chrome that ignores SIGTERM cannot
+        # hold the caller for longer than the escalation window.
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
             proc.wait(timeout=5)
-        except (ProcessLookupError, subprocess.TimeoutExpired):
+        except ProcessLookupError:
+            # Already gone, but still reap so it does not linger as a zombie.
+            try:
+                proc.wait(timeout=1)
+            except (subprocess.TimeoutExpired, ChildProcessError):
+                pass
+        except subprocess.TimeoutExpired:
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             except ProcessLookupError:
                 pass
+            else:
+                # Reap the SIGKILLed child. Without this every Chrome that
+                # ignored SIGTERM leaked one zombie per Engine.close(), so
+                # the process table grew for the life of a long session.
+                try:
+                    proc.wait(timeout=5)
+                except (subprocess.TimeoutExpired, ChildProcessError):
+                    pass
 
 
 def get_debug_url(port: int) -> str:

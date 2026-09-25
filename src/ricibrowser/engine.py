@@ -31,6 +31,19 @@ from ricibrowser.session import Page, Session
 from ricibrowser.utils import truncate, validate_url
 
 
+async def _run_blocking(fn, *args):
+    """Run a blocking callable off the event loop.
+
+    Chrome shutdown (SIGTERM, then a bounded wait, then SIGKILL) and
+    profile-directory removal are both synchronous and can take seconds.
+    Calling them directly from an async close() froze the whole loop —
+    measured 5s of total stall for one Chrome that ignored SIGTERM — which
+    stalls every concurrent session on the same loop.
+    """
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, fn, *args)
+
+
 _PROFILE_PREFIX = "ricibrowser_profile_"
 
 
@@ -79,6 +92,22 @@ def _sweep_stale_profiles(max_age_seconds: int = 6 * 3600) -> int:
     return removed
 
 logger = logging.getLogger(__name__)
+
+
+def _make_profile_dir() -> str:
+    """Sweep orphans, then create this engine's temp profile dir (blocking).
+
+    PID-stamped so a later run can tell a dead owner's leftovers from a
+    live sibling engine's profile, and 0700 because the profile holds
+    session cookies and cf_clearance.
+    """
+    _sweep_stale_profiles()
+    path = tempfile.mkdtemp(prefix=f"{_PROFILE_PREFIX}{os.getpid()}_")
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
+    return path
 
 
 class Engine:
@@ -189,17 +218,16 @@ class Engine:
             finally:
                 self._lightpanda = None
         if self._chrome_proc:
+            proc, self._chrome_proc = self._chrome_proc, None
             try:
-                stop_chrome(self._chrome_proc)
+                await _run_blocking(stop_chrome, proc)
             except Exception as exc:
                 logger.warning("Chrome stop failed: %s", exc)
-            finally:
-                self._chrome_proc = None
         # Remove the temp profile only after Chrome is gone, otherwise Chrome
         # rewrites its lock/state files into the half-deleted directory.
         if self._temp_user_data_dir:
-            shutil.rmtree(self._temp_user_data_dir, ignore_errors=True)
-            self._temp_user_data_dir = None
+            profile, self._temp_user_data_dir = self._temp_user_data_dir, None
+            await _run_blocking(shutil.rmtree, profile, True)
 
     # ── Lightpanda path ────────────────────────────────────────────
 
@@ -265,16 +293,16 @@ class Engine:
                         return debug_url
             except Exception:
                 logger.warning("Chrome process alive but not responding — restarting")
-                stop_chrome(self._chrome_proc)
-            self._chrome_proc = None
+                proc, self._chrome_proc = self._chrome_proc, None
+                await _run_blocking(stop_chrome, proc)
 
         # If old Chrome exited (zombie), clean up
         if self._chrome_proc is not None:
+            proc, self._chrome_proc = self._chrome_proc, None
             try:
-                self._chrome_proc.wait(timeout=0.1)
+                await _run_blocking(proc.wait, 0.1)
             except Exception:
                 pass
-            self._chrome_proc = None
 
         self._chrome_port = self.config.chrome_debug_port or find_free_port()
         debug_url = get_debug_url(self._chrome_port)
@@ -287,14 +315,8 @@ class Engine:
         user_data_dir = self.config.user_data_dir
         if not user_data_dir:
             if not self._temp_user_data_dir:
-                _sweep_stale_profiles()
-                self._temp_user_data_dir = tempfile.mkdtemp(
-                    prefix=f"ricibrowser_profile_{os.getpid()}_"
-                )
-                try:
-                    os.chmod(self._temp_user_data_dir, 0o700)
-                except OSError:
-                    pass
+                # Directory creation + the sweep walk /tmp; both blocking.
+                self._temp_user_data_dir = await _run_blocking(_make_profile_dir)
             user_data_dir = self._temp_user_data_dir
 
         self._chrome_proc = launch_chrome(
@@ -336,8 +358,8 @@ class Engine:
                     pass
                 await asyncio.sleep(poll_interval)
         if self._chrome_proc is not None:
-            stop_chrome(self._chrome_proc)
-            self._chrome_proc = None
+            proc, self._chrome_proc = self._chrome_proc, None
+            await _run_blocking(stop_chrome, proc)
         raise RuntimeError(
             f"Chrome did not become ready after {startup_timeout:.0f}s"
         )
