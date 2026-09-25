@@ -182,6 +182,15 @@ class CDPClient:
                 f"Timeout waiting {self._command_timeout:.1f}s for response to {method}; "
                 "CDP connection retired",
             )
+        except asyncio.CancelledError:
+            # The *caller* was cancelled (wait_for timeout, task teardown,
+            # shutdown). asyncio.wait_for cancels the inner future but it
+            # stays in _pending; when the browser's reply later arrives the
+            # recv loop called set_result on a dead future, raising
+            # InvalidStateError and tearing down every other in-flight
+            # command. Drop our entry so a late reply is treated as unknown.
+            self._pending.pop(msg_id, None)
+            raise
 
     async def on_event(self, event_name: str, callback: CDPEventCallback) -> None:
         """Register a callback for a CDP event (e.g. "Page.loadEventFired").
@@ -252,6 +261,13 @@ class CDPClient:
                     if fut is None:
                         logger.warning("CDP: received response for unknown id %s", msg["id"])
                         continue
+                    # A future can already be resolved/cancelled (late reply
+                    # to a command whose caller went away). Settling it would
+                    # raise InvalidStateError *outside* the inner try and kill
+                    # the recv loop, rejecting every other in-flight command —
+                    # so guard every settle.
+                    if fut.done():
+                        continue
                     if "error" in msg:
                         err = msg["error"]
                         fut.set_exception(CDPError(
@@ -290,9 +306,14 @@ class CDPClient:
             self._pending.clear()
 
     async def close(self) -> None:
-        """Close the WebSocket connection and stop the recv task."""
-        if self._closed:
-            return
+        """Close the WebSocket connection and stop the recv task.
+
+        Idempotent, and safe to call after the recv loop has already died:
+        the loop's ``finally`` sets ``_closed = True`` on ANY exit, so
+        returning early on that flag leaked the socket and the attached
+        Chrome tab for the life of the process. The transport teardown now
+        always runs (the websocket close is itself idempotent).
+        """
         self._closed = True
         if self._recv_task and not self._recv_task.done():
             self._recv_task.cancel()

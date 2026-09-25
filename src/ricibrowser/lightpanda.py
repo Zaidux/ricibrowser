@@ -112,7 +112,9 @@ class LightpandaEngine:
 
     async def stop(self) -> None:
         """Disconnect from Lightpanda."""
-        if self._client and not self._client.is_closed:
+        if self._client:
+            # Unconditional: is_closed is set by the recv loop's finally, which
+            # is exactly when the socket still needs closing. Idempotent.
             await self._client.close()
         self._client = None
         self._started = False

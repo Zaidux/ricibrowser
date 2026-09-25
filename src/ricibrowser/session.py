@@ -635,12 +635,10 @@ class Session:
                 # process umask (commonly 0644). mkstemp already gives 0600;
                 # this covers the explicit-path branch.
                 fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-                try:
-                    with os.fdopen(fd, "wb") as f:
-                        f.write(base64.b64decode(data_b64))
-                except Exception:
-                    os.close(fd)
-                    raise
+                # os.fdopen takes ownership of fd; do NOT close it again on
+                # failure — that raises EBADF and masks the real error.
+                with os.fdopen(fd, "wb") as f:
+                    f.write(base64.b64decode(data_b64))
                 try:
                     os.chmod(path, 0o600)
                 except OSError:
@@ -649,6 +647,11 @@ class Session:
             logger.warning("Screenshot returned no data")
         except CDPError as exc:
             logger.warning("Screenshot failed: %s", exc)
+        except Exception as exc:
+            # Bad base64, a full disk, a read-only path — none of these are
+            # CDPError, and letting them escape skipped the temp-file cleanup
+            # below (leaving a 0-byte PNG) and reached the caller raw.
+            logger.warning("Screenshot write failed: %s", exc)
 
         if created_temp:
             try:
@@ -1232,19 +1235,23 @@ class Session:
         while _time.monotonic() < deadline:
             try:
                 cur = await self.evaluate("location.href")
-                if cur is None:
-                    continue
-                polled_once = True
-                if cur == last_url:
-                    if cur and cur != url_before:
-                        logger.debug("URL stabilised after click: %s", cur)
-                        self._current_url = cur
-                    return
-                last_url = cur
+                if cur is not None:
+                    polled_once = True
+                    if cur == last_url:
+                        if cur and cur != url_before:
+                            logger.debug("URL stabilised after click: %s", cur)
+                            self._current_url = cur
+                        return
+                    last_url = cur
+                # A None result means the execution context is gone — the
+                # normal state right after a click that navigates. Fall
+                # through to the sleep instead of `continue`: jumping to the
+                # while-condition skipped the delay entirely and spun
+                # thousands of Runtime.evaluate round-trips per second for
+                # the whole 8s deadline, flooding the shared socket.
             except Exception:
                 if polled_once:
                     return
-                pass
             await _aio.sleep(0.5)
 
     async def get_dom(self) -> str:
@@ -1446,5 +1453,8 @@ class Session:
 
     async def close(self) -> None:
         """Close the session and its CDP connection."""
-        if self._cdp and not self._cdp.is_closed:
+        if self._cdp:
+            # Not gated on is_closed: that flag is also set by the recv
+            # loop's finally block, i.e. precisely when the transport still
+            # needs tearing down. CDPClient.close() is idempotent.
             await self._cdp.close()
