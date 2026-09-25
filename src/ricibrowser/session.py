@@ -630,8 +630,21 @@ class Session:
             result = await self._cdp.send("Page.captureScreenshot", params)
             data_b64 = result.get("data", "")
             if data_b64:
-                with open(path, "wb") as f:
-                    f.write(base64.b64decode(data_b64))
+                # Screenshots of authenticated pages carry session state, so
+                # an operator-supplied path is written 0600 rather than the
+                # process umask (commonly 0644). mkstemp already gives 0600;
+                # this covers the explicit-path branch.
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                try:
+                    with os.fdopen(fd, "wb") as f:
+                        f.write(base64.b64decode(data_b64))
+                except Exception:
+                    os.close(fd)
+                    raise
+                try:
+                    os.chmod(path, 0o600)
+                except OSError:
+                    pass
                 return path
             logger.warning("Screenshot returned no data")
         except CDPError as exc:
@@ -1038,6 +1051,11 @@ class Session:
             if (type === 'checkbox' || type === 'radio') {
                 rec.checked = !!el.checked;
                 if (type === 'radio' && !el.checked) continue;  // only the chosen one matters
+            } else if (type === 'password') {
+                // Never carry a password value out of the page. The record
+                // is kept (so restore knows the field exists) but the value
+                // is deliberately absent; the caller re-fills it explicitly.
+                rec.redacted = true;
             } else if (tag === 'select' && el.multiple) {
                 rec.multiple = true;
                 rec.value = JSON.stringify(
@@ -1059,8 +1077,13 @@ class Session:
         records suitable for :meth:`restore_form_state`. Fields that cannot
         be re-targeted reliably (no unique id/name/aria-label/placeholder)
         and file/hidden/button inputs are skipped by design; the harvest is
-        capped at 60 records. Note: password fields ARE captured — the
-        store is local to the operator's workspace, same as the cookie jar.
+        capped at 60 records.
+
+        Password fields are recorded as ``{"type": "password", "redacted":
+        True}`` with **no value**: a snapshot is routinely persisted into
+        session/rewind JSON, and a plaintext password in those files is a
+        durable credential leak. :meth:`restore_form_state` skips such
+        records, so a re-filled password must be supplied by the caller.
         """
         try:
             rows = await self.evaluate_value(self._FORM_HARVEST_JS)
@@ -1167,6 +1190,16 @@ class Session:
                     """
                     ok = await self.evaluate_bool(js) is True
                 else:
+                    # A snapshot never carries a password value (see
+                    # snapshot_form_state). Filling the redaction marker or
+                    # an empty string would silently clobber a field the
+                    # operator may have already typed — skip and say so.
+                    if rec.get("redacted") and ftype == "password":
+                        results.append({
+                            "selector": selector, "ok": False, "type": ftype,
+                            "note": "password value was redacted at snapshot time; fill it explicitly",
+                        })
+                        continue
                     ok = await self.fill(
                         selector, str(rec.get("value", "")), timeout=timeout,
                     )

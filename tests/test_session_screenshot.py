@@ -91,3 +91,40 @@ async def test_screenshot_keeps_caller_supplied_path_on_failure(tmp_path):
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# ── permissions (R3) ─────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_screenshot_to_caller_path_is_owner_only(tmp_path):
+    """Screenshots of authenticated pages carry session state.
+
+    An operator-supplied path must not land at the process umask (commonly
+    0644, world-readable); it is written 0600.
+    """
+    async def send(method, params=None):
+        return {"data": "UE5HREFUQQ=="}
+
+    sess = _session(send)
+    target = tmp_path / "shot.png"
+    os.chmod(tmp_path, 0o755)
+    path = await sess.screenshot(path=str(target))
+    assert path == str(target)
+    mode = os.stat(target).st_mode & 0o777
+    assert mode == 0o600, f"expected 0600, got {oct(mode)}"
+
+
+@pytest.mark.asyncio
+async def test_screenshot_temp_path_is_owner_only():
+    async def send(method, params=None):
+        return {"data": "UE5HREFUQQ=="}
+
+    sess = _session(send)
+    path = await sess.screenshot()
+    try:
+        mode = os.stat(path).st_mode & 0o777
+        assert mode == 0o600, f"expected 0600, got {oct(mode)}"
+    finally:
+        if path:
+            os.unlink(path)

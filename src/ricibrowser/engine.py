@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import shutil
 import subprocess
 import tempfile
@@ -28,6 +29,54 @@ from ricibrowser.lightpanda import LightpandaEngine
 from ricibrowser.network import NetworkCapture
 from ricibrowser.session import Page, Session
 from ricibrowser.utils import truncate, validate_url
+
+
+_PROFILE_PREFIX = "ricibrowser_profile_"
+
+
+def _sweep_stale_profiles(max_age_seconds: int = 6 * 3600) -> int:
+    """Delete orphaned ``ricibrowser_profile_*`` dirs left by crashed runs.
+
+    close() removes the profile on a clean exit, but a SIGKILL or a
+    ``kill -9`` skips it — leaving a Chrome profile (session cookies,
+    cf_clearance, localStorage) in /tmp indefinitely. Directories are
+    PID-stamped, so a live sibling engine's profile is identifiable and
+    skipped; anything older than *max_age_seconds* is removed as a
+    backstop for a PID that was reused.
+
+    Returns the number of directories removed. Never raises.
+    """
+    import glob
+    import time
+
+    removed = 0
+    tmp = tempfile.gettempdir()
+    cutoff = time.time() - max_age_seconds
+    for entry in glob.glob(os.path.join(tmp, _PROFILE_PREFIX + "*")):
+        rest = os.path.basename(entry)[len(_PROFILE_PREFIX):]
+        pid_part = rest.split("_", 1)[0]
+        try:
+            pid = int(pid_part)
+        except ValueError:
+            continue
+        if pid == os.getpid():
+            continue
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            pass            # owner is gone — safe to delete
+        except OSError:
+            continue        # alive but not ours (EPERM) — leave it alone
+        else:
+            continue        # process is still running
+        try:
+            if os.path.getmtime(entry) > cutoff:
+                continue
+            shutil.rmtree(entry, ignore_errors=True)
+            removed += 1
+        except OSError:
+            continue
+    return removed
 
 logger = logging.getLogger(__name__)
 
@@ -238,7 +287,14 @@ class Engine:
         user_data_dir = self.config.user_data_dir
         if not user_data_dir:
             if not self._temp_user_data_dir:
-                self._temp_user_data_dir = tempfile.mkdtemp(prefix="ricibrowser_profile_")
+                _sweep_stale_profiles()
+                self._temp_user_data_dir = tempfile.mkdtemp(
+                    prefix=f"ricibrowser_profile_{os.getpid()}_"
+                )
+                try:
+                    os.chmod(self._temp_user_data_dir, 0o700)
+                except OSError:
+                    pass
             user_data_dir = self._temp_user_data_dir
 
         self._chrome_proc = launch_chrome(

@@ -34,7 +34,6 @@ layer built entirely on CDP (Chrome DevTools Protocol).
 | `cookie_jar.py` | Persistent JSON cookie/localStorage jar (survives browser restarts) |
 | `network.py` | Opt-in request/response capture via CDP Network domain (off by default) |
 | `wait.py` | Auto-wait: network-idle + DOM-stability polling |
-| `proxy_integration.py` | miniproxy (mitmproxy) integration: route Chrome through the proxy |
 | `utils.py` | URL validation, HTML stripping, link extraction, CF detection, truncation |
 
 ## Anti-detection design

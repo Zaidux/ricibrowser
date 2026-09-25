@@ -77,7 +77,14 @@ class ProxyEntry:
     url: str
     """Proxy URL (e.g. http://user:pass@host:port)."""
     username: str | None = None
+    """Optional username for an authenticated proxy.
+
+    Currently part of the public shape for callers that supply credentials
+    alongside ``url``; the pool itself does not read these two fields when
+    rotating (it hands ``url`` to the browser verbatim).
+    """
     password: str | None = None
+    """Optional password for an authenticated proxy. See ``username``."""
     country: str | None = None
     """Country code for geographic matching."""
     healthy: bool = True

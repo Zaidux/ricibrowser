@@ -167,3 +167,75 @@ class TestChromeIsolation:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# ── stale temp-profile sweep (R4) ───────────────────────────────────
+
+
+def test_sweep_removes_stale_dead_pid_profiles(tmp_path, monkeypatch):
+    """A crashed CLI leaves a Chrome profile (cookies, cf_clearance) in /tmp.
+
+    close() never runs on SIGKILL, so the profile must be swept later. The
+    dirs are PID-stamped, letting the sweep tell "owner is gone" from
+    "another engine is still using it".
+    """
+    import os
+    import time
+
+    import ricibrowser.engine as engine_mod
+
+    root = tmp_path / "tmp"
+    root.mkdir()
+    monkeypatch.setattr(engine_mod.tempfile, "gettempdir", lambda: str(root))
+
+    dead = str(root / f"{engine_mod._PROFILE_PREFIX}999999_a")
+    os.makedirs(dead)
+    old = time.time() - 90000          # well past the 6h cutoff
+    os.utime(dead, (old, old))
+
+    removed = engine_mod._sweep_stale_profiles()
+    assert removed == 1
+    assert not os.path.exists(dead)
+
+
+def test_sweep_keeps_recent_and_own_profiles(tmp_path, monkeypatch):
+    import os
+    import time
+
+    import ricibrowser.engine as engine_mod
+
+    root = tmp_path / "tmp"
+    root.mkdir()
+    monkeypatch.setattr(engine_mod.tempfile, "gettempdir", lambda: str(root))
+
+    # Dead owner but recent mtime — kept as a PID-reuse backstop.
+    recent = str(root / f"{engine_mod._PROFILE_PREFIX}999999_b")
+    os.makedirs(recent)
+    # Our own PID — never swept, even if old.
+    own = str(root / f"{engine_mod._PROFILE_PREFIX}{os.getpid()}_c")
+    os.makedirs(own)
+    old = time.time() - 90000
+    os.utime(own, (old, old))
+
+    assert engine_mod._sweep_stale_profiles() == 0
+    assert os.path.exists(recent)
+    assert os.path.exists(own)
+
+
+def test_sweep_ignores_unrelated_and_malformed_dirs(tmp_path, monkeypatch):
+    import os
+
+    import ricibrowser.engine as engine_mod
+
+    root = tmp_path / "tmp"
+    root.mkdir()
+    monkeypatch.setattr(engine_mod.tempfile, "gettempdir", lambda: str(root))
+
+    other = str(root / "some_other_tool_dir")
+    os.makedirs(other)
+    malformed = str(root / f"{engine_mod._PROFILE_PREFIX}notapid_d")
+    os.makedirs(malformed)
+
+    assert engine_mod._sweep_stale_profiles() == 0
+    assert os.path.exists(other)
+    assert os.path.exists(malformed)

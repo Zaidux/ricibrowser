@@ -79,7 +79,6 @@ ricibrowser/
 │       ├── stealth.py               # Stealth: launch-flag-based webdriver suppression, no JS injection
 │       ├── cookie_jar.py            # Persistent cookie/localStorage jar (JSON on disk)
 │       ├── network.py               # Network capture/interception (opt-in debug mode, off by default)
-│       ├── proxy_integration.py     # miniproxy integration: route browser through mitmproxy
 │       ├── wait.py                  # Auto-wait: network-idle + DOM-stability polling
 │       └── utils.py                 # URL validation, HTML stripping, screenshot helpers
 ├── tests/
@@ -443,7 +442,6 @@ def browser_navigate(url, through_proxy=False):
 - [ ] `cookie_jar.py`: persistent cookie/localStorage in JSON
 - [ ] `network.py`: opt-in network capture (off by default)
 - [ ] `wait.py`: network-idle + DOM-stability auto-wait
-- [ ] `proxy_integration.py`: route Chrome through miniproxy
 - [ ] Wire into backend `BrowserSession`
 - [ ] Wire into CLI investigation `browser_navigate`/`browser_eval`/`browser_screenshot`
 - [ ] Delete `backend/services/dom_scanner.py` dead code OR rewire it

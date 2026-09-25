@@ -228,6 +228,44 @@ def test_restore_exception_in_field_is_caught(monkeypatch):
     assert results[0]["ok"] is False
 
 
+# ── password redaction (R2) ─────────────────────────────────────────
+
+
+def test_harvest_js_redacts_password_values():
+    """The in-page harvester must never emit a password value.
+
+    Snapshots are persisted into session/rewind JSON, so a plaintext
+    password there is a durable credential leak — the record survives
+    (so restore knows the field exists) but the value does not.
+    """
+    js = Session._FORM_HARVEST_JS
+    assert "rec.redacted = true" in js
+    # The password branch must precede the generic value assignment, else
+    # the generic branch would capture the secret.
+    assert js.index("type === 'password'") < js.index("rec.value = el.isContentEditable")
+
+
+def test_restore_skips_redacted_password(monkeypatch):
+    sess, calls = _session(monkeypatch)
+    results = _run(sess.restore_form_state([
+        {"selector": "#pw", "type": "password", "redacted": True},
+    ]))
+    assert results[0]["ok"] is False
+    assert "redacted" in results[0]["note"]
+    # Crucially: fill() must NOT have been called on the password field.
+    assert not [c for c in calls if c[0] == "fill"]
+
+
+def test_restore_still_fills_password_when_value_explicitly_supplied(monkeypatch):
+    """Opt-in escape hatch: a caller may pass a password explicitly."""
+    sess, calls = _session(monkeypatch)
+    results = _run(sess.restore_form_state([
+        {"selector": "#pw", "type": "password", "value": "hunter2"},
+    ]))
+    assert results[0]["ok"] is True
+    assert [c for c in calls if c[0] == "fill"]
+
+
 # ── helper ───────────────────────────────────────────────────────────
 
 
