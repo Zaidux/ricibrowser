@@ -280,3 +280,72 @@ async def test_engine_close_does_not_block_the_loop():
             proc.wait(timeout=5)
         except Exception:
             pass
+
+
+# ── 11. one session's stop() must not disable another's capture ──
+
+
+@pytest.mark.asyncio
+async def test_network_capture_isolates_concurrent_sessions():
+    """NetworkCapture is Engine-scoped; state must be keyed per client.
+
+    CDP requestIds are per-connection, so two sessions collide on them, and
+    a shared _active flag let one session's stop() end the other's capture
+    and flush its in-flight flows.
+    """
+    from ricibrowser.network import NetworkCapture
+
+    class _Client:
+        def __init__(self):
+            self.handlers: dict[str, list] = {}
+            self.sent: list[str] = []
+
+        async def on_event(self, name, cb):
+            self.handlers.setdefault(name, []).append(cb)
+
+        async def send(self, method, params=None):
+            self.sent.append(method)
+            return {}
+
+        async def fire(self, name, params):
+            for cb in self.handlers.get(name, []):
+                await cb(params)
+
+    cap = NetworkCapture(enabled=True)
+    a, b = _Client(), _Client()
+    await cap.start(a)
+    await cap.start(b)
+
+    # Same requestId on both connections — must not collide.
+    await a.fire("Network.requestWillBeSent", {
+        "requestId": "1", "request": {"url": "https://a.test/x", "method": "GET"},
+        "timestamp": 1.0, "type": "Document"})
+    await b.fire("Network.requestWillBeSent", {
+        "requestId": "1", "request": {"url": "https://b.test/y", "method": "POST"},
+        "timestamp": 1.0, "type": "XHR"})
+
+    # Session A stops. Session B's pending flow must survive.
+    await cap.stop(a)
+
+    assert cap._active is True, "stopping one session disabled the other"
+    await b.fire("Network.loadingFinished", {"requestId": "1", "timestamp": 2.0})
+    urls = sorted(f.url for f in cap.flows)
+    assert urls == ["https://b.test/y"], urls
+    # A's flow is gone with A, not silently merged into B's results.
+    assert all("a.test" not in u for u in urls)
+
+
+@pytest.mark.asyncio
+async def test_network_stop_of_unknown_client_is_noop():
+    from ricibrowser.network import NetworkCapture
+
+    class _Client:
+        async def on_event(self, name, cb):
+            pass
+
+        async def send(self, method, params=None):
+            return {}
+
+    cap = NetworkCapture(enabled=True)
+    await cap.stop(_Client())          # never started
+    assert cap.flows == []

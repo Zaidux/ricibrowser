@@ -444,7 +444,12 @@ class Engine:
         if self.config.header_consistency:
             await self._header_manager.apply(client)
 
-        # Human mouse input (bezier-curve movement)
+        # Human mouse input (bezier-curve movement). NOTE: this is
+        # Engine-scoped, so with concurrent sessions the value reflects the
+        # most recently created one. Nothing in the package reads it —
+        # Session/captcha/input each construct their own HumanMouse bound to
+        # the right client — so it is not currently a cross-session hazard;
+        # a consumer of the public `human_mouse` property must be aware.
         if self.config.human_input:
             self._human_mouse = HumanMouse(
                 client,

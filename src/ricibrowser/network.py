@@ -51,57 +51,101 @@ class NetworkCapture:
 
     def __init__(self, enabled: bool = False):
         self.enabled = enabled
-        self.flows: list[Flow] = []
+        self._flows: list[Flow] = []
         self._pending: dict[str, Flow] = {}
         self._active = False
+        # One Engine can host several concurrent Sessions, each with its own
+        # CDPClient. CDP requestIds are per-connection and collide across
+        # them, and a single shared _active flag meant one session's stop()
+        # disabled every other session's capture. State is therefore keyed by
+        # client, and the event handlers are bound to their own client so an
+        # inbound event can be routed back to the right bucket.
+        self._by_client: dict[int, dict] = {}
         self._MAX_PENDING = 1000  # cap to prevent unbounded memory growth
+
+    @property
+    def flows(self) -> list[Flow]:
+        """Captured flows, newest last, across every active client."""
+        merged: list[Flow] = []
+        for state in self._by_client.values():
+            merged.extend(state["flows"])
+        return merged
+
+    def _state(self, key: int) -> dict:
+        return self._by_client.setdefault(key, {"flows": [], "pending": {}})
 
     async def start(self, cdp: CDPClient) -> None:
         """Enable network capture. This calls CDP Network.enable (detection vector!).
 
         Only call this when debug mode is explicitly requested.
         """
-        if not self.enabled or self._active:
+        if not self.enabled:
             return
+        key = id(cdp)
+        if key in self._by_client:
+            return
+        self._by_client[key] = {"flows": [], "pending": {}}
         self._active = True
-        self._pending.clear()
-        self.flows.clear()
 
-        await cdp.on_event("Network.requestWillBeSent", self._on_request)
-        await cdp.on_event("Network.responseReceived", self._on_response)
-        await cdp.on_event("Network.loadingFinished", self._on_finished)
-        await cdp.on_event("Network.loadingFailed", self._on_failed)
+        await cdp.on_event(
+            "Network.requestWillBeSent",
+            lambda p, k=key: self._on_request(k, p),
+        )
+        await cdp.on_event(
+            "Network.responseReceived",
+            lambda p, k=key: self._on_response(k, p),
+        )
+        await cdp.on_event(
+            "Network.loadingFinished",
+            lambda p, k=key: self._on_finished(k, p),
+        )
+        await cdp.on_event(
+            "Network.loadingFailed",
+            lambda p, k=key: self._on_failed(k, p),
+        )
 
         try:
             await cdp.send("Network.enable")
             logger.info("Network capture enabled (debug mode)")
         except CDPError as exc:
             logger.warning("Network.enable failed: %s", exc)
-            self._active = False
+            self._by_client.pop(key, None)
+            self._active = bool(self._by_client)
 
     async def stop(self, cdp: CDPClient) -> None:
-        """Disable network capture."""
-        if not self._active:
+        """Disable network capture for *this client only*."""
+        key = id(cdp)
+        state = self._by_client.get(key)
+        if state is None:
             return
-        self._active = False
         # Move any pending flows to completed (they never got a terminal event)
-        for flow in self._pending.values():
-            self.flows.append(flow)
-        self._pending.clear()
+        state["flows"].extend(state["pending"].values())
+        state["pending"].clear()
+        self._by_client.pop(key, None)
+        self._active = bool(self._by_client)
         try:
             await cdp.send("Network.disable")
         except CDPError:
             pass
 
-    async def _on_request(self, params: dict) -> None:
+    def clear(self) -> None:
+        """Drop all captured flows across every client."""
+        self._flows.clear()
+        for state in self._by_client.values():
+            state["flows"].clear()
+            state["pending"].clear()
+
+    async def _on_request(self, key: int, params: dict) -> None:
         """Handle Network.requestWillBeSent."""
-        if not self._active:
+        state = self._by_client.get(key)
+        if state is None:
             return
+        pending = state["pending"]
         # Evict oldest if at capacity (prevents unbounded growth from
         # flows that never get a terminal event — SSE, WebSocket upgrades).
-        if len(self._pending) >= self._MAX_PENDING:
-            oldest_key = next(iter(self._pending))
-            self.flows.append(self._pending.pop(oldest_key))
+        if len(pending) >= self._MAX_PENDING:
+            oldest_key = next(iter(pending))
+            state["flows"].append(pending.pop(oldest_key))
         flow = Flow(
             request_id=params.get("requestId", ""),
             url=params.get("request", {}).get("url", ""),
@@ -111,14 +155,14 @@ class NetworkCapture:
             timestamp=params.get("timestamp", 0.0),
             resource_type=params.get("type", ""),
         )
-        self._pending[flow.request_id] = flow
+        pending[flow.request_id] = flow
 
-    async def _on_response(self, params: dict) -> None:
+    async def _on_response(self, key: int, params: dict) -> None:
         """Handle Network.responseReceived."""
-        if not self._active:
+        state = self._by_client.get(key)
+        if state is None:
             return
-        req_id = params.get("requestId", "")
-        flow = self._pending.get(req_id)
+        flow = state["pending"].get(params.get("requestId", ""))
         if flow:
             resp = params.get("response", {})
             flow.response_status = resp.get("status", 0)
@@ -126,20 +170,24 @@ class NetworkCapture:
             flow.mime_type = resp.get("mimeType", "")
             flow.url = flow.url or resp.get("url", "")
 
-    async def _on_finished(self, params: dict) -> None:
+    async def _on_finished(self, key: int, params: dict) -> None:
         """Handle Network.loadingFinished."""
-        req_id = params.get("requestId", "")
-        flow = self._pending.pop(req_id, None)
+        state = self._by_client.get(key)
+        if state is None:
+            return
+        flow = state["pending"].pop(params.get("requestId", ""), None)
         if flow:
             flow.duration = params.get("timestamp", 0.0) - flow.timestamp
-            self.flows.append(flow)
+            state["flows"].append(flow)
 
-    async def _on_failed(self, params: dict) -> None:
+    async def _on_failed(self, key: int, params: dict) -> None:
         """Handle Network.loadingFailed."""
-        req_id = params.get("requestId", "")
-        flow = self._pending.pop(req_id, None)
+        state = self._by_client.get(key)
+        if state is None:
+            return
+        flow = state["pending"].pop(params.get("requestId", ""), None)
         if flow:
-            self.flows.append(flow)
+            state["flows"].append(flow)
 
     def to_dict(self) -> list[dict]:
         """Return captured flows as a list of dicts."""
