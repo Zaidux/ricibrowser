@@ -18,8 +18,10 @@ import os
 import tempfile
 import time as _time
 import hashlib
+import inspect
+import uuid
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from ricibrowser.cdp_client import CDPClient, CDPError
 from ricibrowser.utils import detect_cloudflare, extract_links, strip_html, truncate, validate_url
@@ -38,7 +40,7 @@ class Page:
     """The URL requested."""
     final_url: str
     """The URL after redirects (may differ from url)."""
-    status_code: int
+    status_code: int | None
     """HTTP status code (0 if unknown)."""
     title: str
     """Page <title>."""
@@ -62,11 +64,30 @@ class Page:
     """Which engine produced this page ('lightpanda' or 'cdp_chrome')."""
     accessibility_snapshot: dict[str, Any] | None = None
     """Hybrid accessibility/DOM snapshot when requested."""
+    status_source: str = "unavailable"
+    """Where status_code came from (navigation/interaction/unavailable)."""
+    navigation_error: str | None = None
+    """CDP navigation/transport error, if one occurred."""
+    wait_timed_out: bool = False
+    """Whether the selected navigation wait reached its deadline."""
+    wait_mode: str | None = None
+    """The requested navigation wait mode."""
+    document_id: str | None = None
+    """Opaque loader/document identifier when available."""
+    document_generation: int = 0
+    """Monotonic per-Session document generation."""
+    stealth: bool | None = True
+    """Actual configured stealth mode, or None when unknown."""
+    capabilities: dict[str, Any] = field(default_factory=dict)
+    """Serializable capabilities of the engine/session that produced this page."""
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to a dict matching the existing tool_browse return format."""
+        outcome = "error" if self.navigation_error else (
+            "ok" if self.status_code not in (None, 0) else "partial"
+        )
         return {
-            "status": "ok",
+            "status": outcome,
             "tool": "browse",
             "url": self.final_url,
             "http_status": self.status_code,
@@ -77,12 +98,19 @@ class Page:
             "link_count": len(self.links),
             "truncated": self.truncated,
             "cookies": self.cookies,
-            "stealth": True,
+            "stealth": self.stealth,
             "anti_bot_detected": self.cloudflare_challenge,
             "anti_bot_type": self.cloudflare_type,
             "screenshot_path": self.screenshot_path,
             "engine": self.engine,
             "accessibility_snapshot": self.accessibility_snapshot,
+            "status_source": self.status_source,
+            "navigation_error": self.navigation_error,
+            "wait_timed_out": self.wait_timed_out,
+            "wait_mode": self.wait_mode,
+            "document_id": self.document_id,
+            "document_generation": self.document_generation,
+            "capabilities": self.capabilities,
         }
 
 
@@ -101,15 +129,86 @@ class Session:
         self._page_enabled = False
         self._current_url: str = ""
         self._last_status_code: int = 0
+        self._status_source: str = "unavailable"
+        self._status_document_generation: int = 0
+        self._navigation_error: str | None = None
+        self._wait_timed_out: bool = False
+        self._wait_mode: str | None = None
+        self._document_generation: int = 0
+        self._document_id: str = ""
         self._navigation_id: int = 0
         self._snapshot_id: str = ""
         self._snapshot_refs: dict[str, dict[str, Any]] = {}
         # Last JS evaluation exception (None when the last evaluate succeeded).
         # Lets callers distinguish "expression threw" from "returned undefined".
         self._last_eval_error: str | None = None
+        self._last_capture_succeeded: bool = False
+        self._session_id: str = "session_" + uuid.uuid4().hex[:16]
+        self._target_id: str = ""
+        self._stealth: bool | None = None
+        self._close_hook: Callable[["Session"], Awaitable[None] | None] | None = None
+        self._closed = False
+        self._close_finalized = False
+        self._transport_closed = False
+        self._close_lock = _aio.Lock()
+        self._storage_restore: dict[str, dict[str, str]] = {}
+        self._storage_script_id: str | None = None
+        self._checkpoint_hook: Callable[["Session"], Awaitable[None] | None] | None = None
+        self._after_close_hook: Callable[["Session"], Awaitable[None] | None] | None = None
+        self._document_status_by_loader: dict[str, tuple[int, str]] = {}
         # Register for frame navigation events so we invalidate the isolated
         # context when the frame changes (link clicks, SPA navigations, etc.).
         self._setup_frame_listener()
+
+    @property
+    def session_id(self) -> str:
+        return self._session_id
+
+    @property
+    def document_generation(self) -> int:
+        return self._document_generation
+
+    @property
+    def capabilities(self) -> dict[str, Any]:
+        """Serializable, truthful support flags for this Session."""
+        chrome = self._engine_name == "cdp_chrome"
+        return {
+            "engine": self._engine_name,
+            "rendering": chrome,
+            "screenshots": chrome,
+            "http_status": chrome,
+            "reliable_final_url": chrome,
+            "trusted_input": chrome,
+            "accessibility_tree": chrome,
+            "isolated_evaluation": True,
+            "storage_persistence": self._close_hook is not None,
+            "network_metadata": bool(getattr(self, "_network_capture_enabled", False)),
+            "network_bodies": False,
+            "proxy_mode": "route_only" if getattr(self, "_proxy_configured", False) else "none",
+        }
+
+    def _invalidate_document(
+        self, *, frame_id: str = "", url: str = "", document_id: str = "",
+    ) -> None:
+        """Bind contexts, refs, and response provenance to a new document."""
+        self._document_generation += 1
+        if frame_id:
+            self._frame_id = frame_id
+        if url:
+            self._current_url = url
+        self._document_id = document_id
+        self._isolated_context_id = None
+        self._snapshot_id = ""
+        self._snapshot_refs = {}
+        self._last_status_code = 0
+        self._status_source = "unavailable"
+        self._status_document_generation = self._document_generation
+        self._navigation_error = None
+        self._wait_timed_out = False
+        if document_id and document_id in self._document_status_by_loader:
+            status, _response_url = self._document_status_by_loader[document_id]
+            self._last_status_code = status
+            self._status_source = "interaction_response"
 
     def _setup_frame_listener(self) -> None:
         """Register a CDP event handler that invalidates the isolated context
@@ -134,16 +233,55 @@ class Session:
                 return
             new_frame_id = frame.get("id", "")
             new_url = frame.get("url", "")
-            if new_frame_id and new_frame_id != self._frame_id:
-                self._frame_id = new_frame_id
-                self._isolated_context_id = None
-                self._snapshot_id = ""
-                self._snapshot_refs = {}
-                if new_url:
-                    self._current_url = new_url
-                logger.debug("Main frame navigated to %s, isolated context invalidated", new_url)
+            # Chrome normally reuses the main-frame ID across full document
+            # navigations.  Loader ID (and, conservatively, every top-level
+            # frameNavigated event) is the document boundary.
+            self._invalidate_document(
+                frame_id=new_frame_id,
+                url=new_url,
+                document_id=str(frame.get("loaderId") or ""),
+            )
+            logger.debug("Main document navigated to %s; generation=%d", new_url, self._document_generation)
+
+        def _on_within_document(params: dict) -> None:
+            frame_id = str(params.get("frameId") or "")
+            if self._frame_id and frame_id and frame_id != self._frame_id:
+                return
+            # History API/hash changes do not replace the JS document, but refs
+            # are URL-scoped evidence and can otherwise act on a rerendered SPA.
+            self._document_generation += 1
+            self._current_url = str(params.get("url") or self._current_url)
+            self._snapshot_id = ""
+            self._snapshot_refs = {}
+            self._last_status_code = 0
+            self._status_source = "unavailable"
+            self._status_document_generation = self._document_generation
+
+        def _on_document_response(params: dict) -> None:
+            if params.get("type") != "Document":
+                return
+            frame_id = str(params.get("frameId") or "")
+            if self._frame_id and frame_id and frame_id != self._frame_id:
+                return
+            response = params.get("response") or {}
+            status = int(response.get("status") or 0)
+            loader_id = str(params.get("loaderId") or "")
+            response_url = str(response.get("url") or "")
+            if loader_id:
+                self._document_status_by_loader[loader_id] = (status, response_url)
+                # Bound redirect/history bookkeeping for long-lived sessions.
+                while len(self._document_status_by_loader) > 64:
+                    self._document_status_by_loader.pop(next(iter(self._document_status_by_loader)))
+            if (loader_id and loader_id == self._document_id) or (
+                not loader_id and frame_id and frame_id == self._frame_id
+            ):
+                self._last_status_code = status
+                self._status_source = "interaction_response"
+                self._status_document_generation = self._document_generation
 
         self._cdp._event_handlers.setdefault("Page.frameNavigated", []).append(_on_frame_navigated)
+        self._cdp._event_handlers.setdefault("Page.navigatedWithinDocument", []).append(_on_within_document)
+        self._cdp._event_handlers.setdefault("Network.responseReceived", []).append(_on_document_response)
 
     async def _ensure_page_enabled(self) -> None:
         """Enable the Page domain (needed for navigation events)."""
@@ -227,7 +365,10 @@ class Session:
             logger.debug("Could not create isolated world: %s", exc)
             return None
 
-    async def navigate(self, url: str, wait_until: str = "load", max_chars: int = 10_000) -> Page:
+    async def navigate(
+        self, url: str, wait_until: str = "load", max_chars: int = 10_000,
+        wait_for: str | None = None, timeout: float | None = None,
+    ) -> Page:
         """Navigate to a URL and wait for the page to settle.
 
         Args:
@@ -236,14 +377,21 @@ class Session:
                 "load" — wait for the load event.
                 "domcontentloaded" — wait for DOMContentLoaded.
                 "networkidle" — wait for network to be idle (requires Network.enabled).
+            wait_for: Optional CSS/label selector that must appear before capture.
+            timeout: Optional per-operation navigation/selector deadline.
 
         Returns:
             A Page with the current state.
         """
         url = validate_url(url)
+        await self._run_checkpoint()
         await self._ensure_page_enabled()
         # Stale status from a previous navigation must not leak into this one.
         self._last_status_code = 0
+        self._status_source = "unavailable"
+        self._wait_timed_out = False
+        self._wait_mode = wait_until
+        wait_started = _time.monotonic()
 
         # Enable Network domain — needed for cookie capture across redirects
         # and for Network.getCookies to return cookies set during the redirect
@@ -261,9 +409,11 @@ class Session:
         # blank/stale page. We now register a load-event waiter BEFORE issuing
         # Page.navigate, so the event can't fire in the gap between the command
         # and the subscription, then await the real load signal.
-        nav_timeout = getattr(self, "_nav_timeout", 30.0)
+        nav_timeout = max(0.01, float(
+            timeout if timeout is not None else getattr(self, "_nav_timeout", 30.0)
+        ))
         loop = _aio.get_event_loop()
-        load_future: "_aio.Future[dict]" = loop.create_future()
+        wait_future: "_aio.Future[dict]" = loop.create_future()
         expected_frame: dict[str, str] = {"id": ""}
 
         # ── HTTP status capture ────────────────────────────────────────
@@ -281,25 +431,39 @@ class Session:
             response = params.get("response") or {}
             doc_responses.append({
                 "frameId": params.get("frameId", ""),
+                "loaderId": params.get("loaderId", ""),
                 "status": int(response.get("status") or 0),
                 "url": response.get("url", ""),
             })
 
-        def _on_load(params: dict) -> None:
-            if not load_future.done():
-                load_future.set_result(params)
+        def _on_wait_event(params: dict) -> None:
+            if not wait_future.done():
+                wait_future.set_result(params)
 
         def _on_frame_stopped(params: dict) -> None:
             fid = params.get("frameId", "")
-            if not load_future.done() and (not expected_frame["id"] or fid == expected_frame["id"]):
-                load_future.set_result(params)
+            if not wait_future.done() and (not expected_frame["id"] or fid == expected_frame["id"]):
+                wait_future.set_result(params)
 
-        self._cdp._event_handlers.setdefault("Page.loadEventFired", []).append(_on_load)
-        self._cdp._event_handlers.setdefault("Page.frameStoppedLoading", []).append(_on_frame_stopped)
+        wait_event = (
+            "Page.domContentEventFired"
+            if wait_until == "domcontentloaded"
+            else "Page.loadEventFired"
+        )
+        self._cdp._event_handlers.setdefault(wait_event, []).append(_on_wait_event)
+        # frameStoppedLoading is a useful load fallback, but it defeats true
+        # DOMContentLoaded semantics by firing only after slow subresources.
+        use_frame_stopped = wait_until != "domcontentloaded"
+        if use_frame_stopped:
+            self._cdp._event_handlers.setdefault("Page.frameStoppedLoading", []).append(_on_frame_stopped)
         self._cdp._event_handlers.setdefault("Network.responseReceived", []).append(_on_response)
 
         try:
             result = await self._cdp.send("Page.navigate", {"url": url})
+            # A response means this operation supersedes any prior navigation
+            # error.  Do this after the command so a transport exception does
+            # not erase the last useful diagnostic.
+            self._navigation_error = None
             # Page.navigate reports hard navigation failures via errorText
             # (net::ERR_NAME_NOT_RESOLVED, ERR_CONNECTION_REFUSED, etc.). A
             # blank page from a failed load is a real error, not a slow render.
@@ -307,6 +471,9 @@ class Session:
             self._frame_id = result.get("frameId", "")
             expected_frame["id"] = self._frame_id
             self._current_url = url
+            nav_loader_id = str(result.get("loaderId") or "")
+            if nav_loader_id:
+                self._document_id = nav_loader_id
 
             # Reset the isolated world (frame changed)
             self._isolated_context_id = None
@@ -315,20 +482,26 @@ class Session:
                 # ERR_ABORTED is benign (e.g. a download or a client redirect
                 # superseding the navigation); anything else is a real failure.
                 logger.warning("Navigation to %s failed: %s", url, error_text)
+                self._navigation_error = str(error_text)
                 page = await self._capture_page(url, max_chars=max_chars)
                 page.status_code = 0
+                page.status_source = "unavailable"
+                page.navigation_error = str(error_text)
                 return page
 
             # Wait for the real load event (bounded). This replaces racing
             # readyState against a stale document.
             try:
-                await _aio.wait_for(load_future, timeout=nav_timeout)
+                await _aio.wait_for(wait_future, timeout=nav_timeout)
             except _aio.TimeoutError:
-                logger.debug("load event not observed within %.1fs; falling back to poll", nav_timeout)
+                self._wait_timed_out = True
+                logger.debug("%s event not observed within %.1fs; falling back to poll", wait_event, nav_timeout)
         finally:
-            for name, cb in (("Page.loadEventFired", _on_load),
-                             ("Page.frameStoppedLoading", _on_frame_stopped),
-                             ("Network.responseReceived", _on_response)):
+            handlers_to_remove = [(wait_event, _on_wait_event),
+                                  ("Network.responseReceived", _on_response)]
+            if use_frame_stopped:
+                handlers_to_remove.append(("Page.frameStoppedLoading", _on_frame_stopped))
+            for name, cb in handlers_to_remove:
                 handlers = self._cdp._event_handlers.get(name)
                 if handlers and cb in handlers:
                     handlers.remove(cb)
@@ -338,6 +511,14 @@ class Session:
         # (cross-origin redirect chains mint a new one), so fall back to the last
         # document response seen, which is the final hop of the chain.
         self._last_status_code = self._resolve_status(doc_responses)
+        if self._last_status_code:
+            self._status_source = "navigation_response"
+            self._status_document_generation = self._document_generation
+        if doc_responses:
+            final_response = doc_responses[-1]
+            response_loader = str(final_response.get("loaderId") or "")
+            if response_loader:
+                self._document_id = response_loader
 
         # Supplementary content-stability wait (DOM settle for SPAs). This now
         # runs AFTER the new document has actually committed + loaded, so the
@@ -359,6 +540,13 @@ class Session:
         else:
             await wait_for_content_stable(self._cdp, self._frame_id, mode=wait_until)
 
+        if wait_for:
+            selector_timeout = max(0.0, nav_timeout - (_time.monotonic() - wait_started))
+            if selector_timeout <= 0 or not await self.wait_for_selector(
+                wait_for, timeout=selector_timeout,
+            ):
+                self._wait_timed_out = True
+
         # ── URL stability: handle JS-based SSO redirects ────────────
         # Some auth flows (OAuth, SAML, SSO) fire a JS redirect AFTER the
         # initial page load completes (window.location, form auto-submit,
@@ -366,10 +554,9 @@ class Session:
         # on the intermediate page. We poll location.href to catch the final
         # URL once the redirect settles.
         #
-        # Fast path: most navigations do NOT redirect post-load. We take one
-        # immediate reading, and only enter the polling loop if the URL differs
-        # from the requested URL (a redirect actually happened). This removes
-        # the fixed ~1s two-poll tax that every navigation used to pay.
+        # Poll through a bounded change-detection window as well as redirect
+        # settling.  A redirect scheduled shortly after load used to be missed
+        # whenever the first immediate URL still matched the request.
         last_url = ""
         stability_timeout = getattr(self, "_url_stability_timeout", 8.0)
         try:
@@ -383,21 +570,56 @@ class Session:
         def _norm(u: str) -> str:
             return (u or "").split("#", 1)[0].rstrip("/")
 
-        if first and _norm(first) != _norm(url) and stability_timeout > 0:
+        immediate_redirect = bool(first and _norm(first) != _norm(url))
+        if first and stability_timeout > 0 and (
+            wait_until != "domcontentloaded" or immediate_redirect
+        ):
             last_url = first
             deadline = _time.monotonic() + stability_timeout
+            changed = immediate_redirect
+            change_timeout = max(0.0, float(
+                getattr(self, "_url_change_timeout", min(1.25, stability_timeout))
+            ))
+            change_deadline = _time.monotonic() + min(change_timeout, stability_timeout)
+            stable_count = 0
             while _time.monotonic() < deadline:
                 await _aio.sleep(0.25)
                 try:
                     cur = await self.evaluate("location.href")
-                    if cur and cur == last_url:
-                        self._current_url = cur
-                        break
-                    last_url = cur or last_url
+                    if not cur:
+                        continue
+                    if _norm(cur) != _norm(url):
+                        changed = True
+                    if changed and cur == last_url:
+                        stable_count += 1
+                        # Two equal observations after a change avoid treating
+                        # the first redirect hop as the settled destination.
+                        if stable_count >= 2:
+                            self._current_url = cur
+                            break
+                    else:
+                        stable_count = 0
+                    last_url = cur
                 except Exception:
                     pass
+                if not changed and _time.monotonic() >= change_deadline:
+                    break
 
-        return await self._capture_page(url, max_chars=max_chars, known_final_url=first or None)
+        page = await self._capture_page(
+            url, max_chars=max_chars, known_final_url=last_url or first or None,
+        )
+        await self._run_checkpoint()
+        return page
+
+    async def _run_checkpoint(self) -> None:
+        if self._checkpoint_hook is None:
+            return
+        try:
+            result = self._checkpoint_hook(self)
+            if inspect.isawaitable(result):
+                await result
+        except Exception as exc:
+            logger.warning("Session state checkpoint failed: %s", exc)
 
     def _resolve_status(self, doc_responses: list[dict[str, Any]]) -> int:
         """Pick the main-frame document status from observed responses.
@@ -415,6 +637,10 @@ class Session:
         """
         if not doc_responses:
             return 0
+        if self._document_id:
+            for entry in reversed(doc_responses):
+                if entry.get("loaderId") == self._document_id:
+                    return int(entry.get("status") or 0)
         for entry in reversed(doc_responses):
             if self._frame_id and entry.get("frameId") == self._frame_id:
                 return int(entry.get("status") or 0)
@@ -453,7 +679,27 @@ class Session:
         # HTTP status observed via Network.responseReceived during navigate().
         # Stays 0 when the page was reached some other way (direct capture,
         # engines without the Network domain).
-        status_code = self._last_status_code
+        status_current = self._status_document_generation == self._document_generation
+        observed_document_change = bool(
+            final_url and self._current_url and final_url != self._current_url
+        )
+        if observed_document_change:
+            # A click/script navigation can commit before its frame/response
+            # callbacks run.  Never attach the previous document's status to a
+            # snapshot whose observed URL already differs.
+            self._last_status_code = 0
+            self._status_source = "unavailable"
+            self._status_document_generation = self._document_generation
+            status_current = False
+            self._current_url = final_url
+        # A response callback can arrive immediately after the snapshot eval.
+        # Yield once so its loader/status provenance is applied before we
+        # serialize an avoidably-unknown current page.
+        if observed_document_change and not self._last_status_code:
+            await _aio.sleep(0)
+            status_current = self._status_document_generation == self._document_generation
+        status_code = self._last_status_code if status_current else 0
+        status_source = self._status_source if status_code else "unavailable"
 
         # Get cookies
         cookies = await self.get_cookies()
@@ -478,7 +724,39 @@ class Session:
             cloudflare_challenge=is_cf,
             cloudflare_type=cf_type,
             engine=self._engine_name,
+            status_source=status_source,
+            navigation_error=self._navigation_error,
+            wait_timed_out=self._wait_timed_out,
+            wait_mode=self._wait_mode,
+            document_id=self._document_id or None,
+            document_generation=self._document_generation,
+            stealth=self._stealth,
+            capabilities=self.capabilities,
         )
+
+    async def snapshot_current_page(
+        self, max_chars: int = 10_000, *, include_accessibility: bool = False,
+        accessibility_options: dict[str, Any] | None = None,
+    ) -> Page:
+        """Publicly snapshot the currently loaded document without navigating.
+
+        This is the supported counterpart of the retained private
+        :meth:`_capture_page`.  Status is included only when its observed
+        document generation still matches the current document.
+        """
+        current_url = self._current_url
+        try:
+            observed = await self.evaluate("location.href")
+            if isinstance(observed, str) and observed:
+                current_url = observed
+        except Exception:
+            pass
+        page = await self._capture_page(current_url, max_chars=max_chars)
+        if include_accessibility:
+            page.accessibility_snapshot = await self.accessibility_snapshot(
+                **(accessibility_options or {})
+            )
+        return page
 
     async def evaluate(self, expression: str) -> Any:
         """Evaluate JavaScript in an isolated world and return the result.
@@ -497,6 +775,7 @@ class Session:
         return self._last_eval_error
 
     async def capture_storage(self) -> tuple[str, dict[str, str]]:
+        self._last_capture_succeeded = False
         result = await self.evaluate_value("""({
           origin: location.origin,
           storage: Object.fromEntries(Object.entries(localStorage))
@@ -505,15 +784,48 @@ class Session:
             return "", {}
         origin = str(result.get("origin") or "")
         storage = result.get("storage")
-        return origin, dict(storage) if isinstance(storage, dict) else {}
+        if not origin or not isinstance(storage, dict):
+            return "", {}
+        self._last_capture_succeeded = True
+        return origin, dict(storage)
 
     async def restore_storage(self, storage: dict[str, str]) -> None:
-        if not storage:
-            return
-        payload = json.dumps(storage)
+        payload = json.dumps(storage or {})
         await self.evaluate_value(
-            f"Object.entries({payload}).forEach(([k,v]) => localStorage.setItem(k, v)); true"
+            f"localStorage.clear(); Object.entries({payload}).forEach(([k,v]) => localStorage.setItem(k, v)); true"
         )
+
+    async def install_storage_restore(self, storage_by_origin: dict[str, dict[str, str]]) -> None:
+        """Install origin-gated localStorage restoration before page scripts.
+
+        ``Page.addScriptToEvaluateOnNewDocument`` runs before application
+        startup in every newly created document.  The script only accesses
+        localStorage for exact configured origins and fails closed for origins
+        where storage is unavailable.
+        """
+        self._storage_restore = {
+            str(origin): {str(k): str(v) for k, v in values.items()}
+            for origin, values in storage_by_origin.items()
+            if isinstance(values, dict)
+        }
+        if not self._storage_restore:
+            return
+        source = """(function(){
+          try {
+            var stores = %s;
+            var wanted = stores[location.origin];
+            if (!wanted) return;
+            localStorage.clear();
+            Object.keys(wanted).forEach(function(k){ localStorage.setItem(k, String(wanted[k])); });
+          } catch (e) {}
+        })();""" % json.dumps(self._storage_restore, separators=(",", ":"))
+        try:
+            result = await self._cdp.send(
+                "Page.addScriptToEvaluateOnNewDocument", {"source": source},
+            )
+            self._storage_script_id = result.get("identifier")
+        except CDPError as exc:
+            logger.warning("pre-document localStorage restore unavailable: %s", exc)
 
     async def evaluate_value(self, expression: str) -> Any:
         """Evaluate in the isolated world and preserve JSON-compatible types.
@@ -543,22 +855,7 @@ class Session:
 
         try:
             result = await self._cdp.send("Runtime.evaluate", params)
-            # Surface JS exceptions: CDP returns exceptionDetails alongside a
-            # null value when the expression throws. Swallowing it made every
-            # JS error an unexplained None — the agent's top browse struggle.
-            exception = result.get("exceptionDetails")
-            if exception:
-                details = exception.get("exception") or {}
-                text = str(
-                    details.get("description")
-                    or details.get("value")
-                    or exception.get("text")
-                    or "JavaScript evaluation threw"
-                )[:500]
-                self._last_eval_error = text
-                return None
-            self._last_eval_error = None
-            return result.get("result", {}).get("value")
+            return self._decode_evaluate_response(result)
         except CDPError as exc:
             # If the contextId was stale (frame changed underneath us), try a
             # fresh isolated world.  If that also fails, fall back to the
@@ -576,19 +873,35 @@ class Session:
                     params.pop("contextId", None)
                 try:
                     result = await self._cdp.send("Runtime.evaluate", params)
-                    return result.get("result", {}).get("value")
-                except CDPError:
-                    pass
+                    return self._decode_evaluate_response(result)
+                except CDPError as retry_exc:
+                    exc = retry_exc
             elif context_id is not None:
                 # Non-context error: try without isolated context as fallback.
                 params.pop("contextId", None)
                 try:
                     result = await self._cdp.send("Runtime.evaluate", params)
-                    return result.get("result", {}).get("value")
-                except CDPError:
-                    pass
+                    return self._decode_evaluate_response(result)
+                except CDPError as fallback_exc:
+                    exc = fallback_exc
+            self._last_eval_error = str(exc)[:500]
             logger.warning("JS evaluation failed: %s", exc)
             return None
+
+    def _decode_evaluate_response(self, response: dict[str, Any]) -> Any:
+        """Decode every initial/retry/fallback Runtime.evaluate response."""
+        exception = response.get("exceptionDetails") or {}
+        if exception:
+            details = exception.get("exception") or {}
+            self._last_eval_error = str(
+                details.get("description")
+                or details.get("value")
+                or exception.get("text")
+                or "JavaScript evaluation threw"
+            )[:500]
+            return None
+        self._last_eval_error = None
+        return (response.get("result") or {}).get("value")
 
     async def evaluate_bool(self, expression: str) -> bool | None:
         """Evaluate a JS expression that returns a boolean.
@@ -1229,19 +1542,30 @@ class Session:
         stabilise (same URL on two consecutive polls, up to 8s default).
         """
         stability_timeout = getattr(self, "_url_stability_timeout", 8.0)
+        change_timeout = max(0.0, float(
+            getattr(self, "_url_change_timeout", min(1.25, stability_timeout))
+        ))
         last_url = ""
         deadline = _time.monotonic() + stability_timeout
+        change_deadline = _time.monotonic() + min(change_timeout, stability_timeout)
         polled_once = False
+        changed = False
+        stable_count = 0
         while _time.monotonic() < deadline:
             try:
                 cur = await self.evaluate("location.href")
                 if cur is not None:
                     polled_once = True
-                    if cur == last_url:
-                        if cur and cur != url_before:
+                    if cur and cur != url_before:
+                        changed = True
+                    if changed and cur == last_url:
+                        stable_count += 1
+                        if stable_count >= 2:
                             logger.debug("URL stabilised after click: %s", cur)
                             self._current_url = cur
-                        return
+                            return
+                    else:
+                        stable_count = 0
                     last_url = cur
                 # A None result means the execution context is gone — the
                 # normal state right after a click that navigates. Fall
@@ -1250,8 +1574,10 @@ class Session:
                 # thousands of Runtime.evaluate round-trips per second for
                 # the whole 8s deadline, flooding the shared socket.
             except Exception:
-                if polled_once:
+                if polled_once and changed:
                     return
+            if not changed and _time.monotonic() >= change_deadline:
+                return
             await _aio.sleep(0.5)
 
     async def get_dom(self) -> str:
@@ -1398,6 +1724,8 @@ class Session:
         self._snapshot_id = snapshot_id
         self._snapshot_refs = {node["ref"]: node for node in nodes}
         return {"snapshot_id": snapshot_id, "navigation_id": self._navigation_id,
+                "document_generation": self._document_generation,
+                "document_id": self._document_id or None,
                 "url": self._current_url, "nodes": nodes[:max_nodes],
                 "node_count": len(nodes), "truncated": len(nodes) >= max_nodes,
                 "source": "cdp_accessibility+dom_aria" if cdp_available and nodes else "dom_aria"}
@@ -1438,11 +1766,17 @@ class Session:
 
     async def get_cookies(self) -> list[dict]:
         """Get all cookies from the browser context."""
+        _ok, cookies = await self._get_cookies_snapshot()
+        return cookies
+
+    async def _get_cookies_snapshot(self) -> tuple[bool, list[dict]]:
+        """Return success separately so persistence never mistakes failure for logout."""
         try:
             result = await self._cdp.send("Network.getCookies")
-            return result.get("cookies", [])
+            cookies = result.get("cookies", [])
+            return True, cookies if isinstance(cookies, list) else []
         except CDPError:
-            return []
+            return False, []
 
     async def set_cookies(self, cookies: list[dict]) -> None:
         """Set cookies in the browser context."""
@@ -1452,9 +1786,29 @@ class Session:
             logger.warning("set_cookies failed: %s", exc)
 
     async def close(self) -> None:
-        """Close the session and its CDP connection."""
-        if self._cdp:
-            # Not gated on is_closed: that flag is also set by the recv
-            # loop's finally block, i.e. precisely when the transport still
-            # needs tearing down. CDPClient.close() is idempotent.
-            await self._cdp.close()
+        """Persist/finalize owned state, then close the CDP connection.
+
+        Idempotent.  Engine-created Sessions receive a lifecycle hook that
+        captures auth state, stops network capture, and closes their owned page
+        target.  Manually constructed Sessions retain the historical behavior
+        of simply closing ``_cdp``.
+        """
+        async with self._close_lock:
+            if self._closed:
+                return
+            if self._close_hook is not None and not self._close_finalized:
+                result = self._close_hook(self)
+                if inspect.isawaitable(result):
+                    await result
+                self._close_finalized = True
+            if self._cdp and not self._transport_closed:
+                # Not gated on is_closed: that flag is also set by the recv
+                # loop's finally block, i.e. precisely when the transport still
+                # needs tearing down. CDPClient.close() is idempotent.
+                await self._cdp.close()
+                self._transport_closed = True
+            if self._after_close_hook is not None:
+                result = self._after_close_hook(self)
+                if inspect.isawaitable(result):
+                    await result
+            self._closed = True

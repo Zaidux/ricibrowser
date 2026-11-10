@@ -63,3 +63,27 @@ async def test_success_after_exception_resets_state():
     assert session.last_eval_error is not None
     assert await session.evaluate("fine") == "ok"
     assert session.last_eval_error is None
+
+
+@pytest.mark.asyncio
+async def test_retry_exception_is_recorded():
+    from ricibrowser.cdp_client import CDPError
+
+    class RetryCdp:
+        def __init__(self):
+            self._event_handlers = {}
+            self.calls = 0
+        async def send(self, method, params=None):
+            if method == "Page.createIsolatedWorld":
+                return {"executionContextId": 1 + self.calls}
+            if method == "Runtime.evaluate":
+                self.calls += 1
+                if self.calls == 1:
+                    raise CDPError(method, -32000, "Cannot find context")
+                return {"result": {"value": None}, "exceptionDetails": {"text": "retry exploded"}}
+            return {}
+
+    session = Session(RetryCdp())
+    session._frame_id = "main"
+    assert await session.evaluate("boom()") is None
+    assert session.last_eval_error == "retry exploded"

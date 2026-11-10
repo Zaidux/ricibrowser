@@ -89,6 +89,7 @@ class CDPClient:
         http_url: str,
         target_id: str | None = None,
         command_timeout: float = 15.0,
+        create_new: bool = False,
     ) -> "CDPClient":
         """Connect to a Chrome CDP target discovered via the HTTP /json API.
 
@@ -96,30 +97,46 @@ class CDPClient:
         2. Find a page-type target (or the one matching target_id)
         3. Connect to its webSocketDebuggerUrl
         """
+        if target_id and create_new:
+            raise ValueError("target_id and create_new are mutually exclusive")
+
         # Reuse one connection pool for target discovery and tab creation.
         async with httpx.AsyncClient(timeout=10.0) as http:
-            resp = await http.get(f"{http_url}/json")
-            if resp.status_code != 200:
-                raise CDPError("connect_to_target", resp.status_code, f"HTTP {resp.status_code}")
-            targets = resp.json()
-
-            # Find the target
             target = None
-            if target_id:
-                # When a specific target_id is requested, search exclusively
-                # for it; do not attach to an unrelated first tab.
-                for t in targets:
-                    if t.get("id") == target_id:
-                        target = t
-                        break
-                if target is None:
-                    raise CDPError("connect_to_target", -1,
-                                   f"Target {target_id} not found in CDP target list")
+            if create_new:
+                # Every Engine-created Session owns a distinct tab.  Selecting
+                # the first existing page made concurrent Sessions aliases for
+                # one another.
+                resp = await http.put(f"{http_url}/json/new?about:blank")
+                if resp.status_code in (200, 201):
+                    target = resp.json()
+                else:
+                    raise CDPError(
+                        "connect_to_target", resp.status_code,
+                        f"Could not create target (HTTP {resp.status_code})",
+                    )
             else:
-                for t in targets:
-                    if t.get("type") == "page":
-                        target = t
-                        break
+                resp = await http.get(f"{http_url}/json")
+                if resp.status_code != 200:
+                    raise CDPError("connect_to_target", resp.status_code, f"HTTP {resp.status_code}")
+                targets = resp.json()
+
+                # Find the target
+                if target_id:
+                    # When a specific target_id is requested, search exclusively
+                    # for it; do not attach to an unrelated first tab.
+                    for t in targets:
+                        if t.get("id") == target_id:
+                            target = t
+                            break
+                    if target is None:
+                        raise CDPError("connect_to_target", -1,
+                                       f"Target {target_id} not found in CDP target list")
+                else:
+                    for t in targets:
+                        if t.get("type") == "page":
+                            target = t
+                            break
 
             if target is None:
                 # Create a new tab if none exists.
@@ -134,7 +151,44 @@ class CDPClient:
         if not ws_url:
             raise CDPError("connect_to_target", -1, "Target has no webSocketDebuggerUrl")
 
-        return await cls.connect(ws_url, command_timeout=command_timeout)
+        client = await cls.connect(ws_url, command_timeout=command_timeout)
+        client._target_id = str(target.get("id") or target.get("targetId") or "")
+        client._target_http_url = http_url
+        return client
+
+    @staticmethod
+    async def create_target(http_url: str, url: str = "about:blank") -> str:
+        """Create and return a new Chrome page target ID.
+
+        Chrome exposes target creation through ``PUT /json/new?<url>``.  Keeping
+        creation separate from :meth:`connect_to_target` lets an Engine record
+        ownership before opening the websocket and close exactly that tab when
+        its Session retires.
+        """
+        from urllib.parse import quote
+
+        endpoint = f"{http_url}/json/new?{quote(url, safe=':/')}"
+        async with httpx.AsyncClient(timeout=10.0) as http:
+            response = await http.put(endpoint)
+            if response.status_code not in (200, 201):
+                raise CDPError(
+                    "Target.createTarget", response.status_code,
+                    f"HTTP {response.status_code}",
+                )
+            target = response.json()
+        target_id = str(target.get("id") or target.get("targetId") or "")
+        if not target_id:
+            raise CDPError("Target.createTarget", -1, "Chrome returned no target id")
+        return target_id
+
+    @staticmethod
+    async def close_target(http_url: str, target_id: str) -> bool:
+        """Close one Chrome page target through the discovery endpoint."""
+        if not target_id:
+            return False
+        async with httpx.AsyncClient(timeout=10.0) as http:
+            response = await http.get(f"{http_url}/json/close/{target_id}")
+        return response.status_code == 200
 
     async def send(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         """Send a CDP command and await the response.

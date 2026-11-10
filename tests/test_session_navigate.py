@@ -218,6 +218,24 @@ async def test_frame_listener_ignores_subframes():
     assert session._isolated_context_id is None
 
 
+def test_same_frame_new_loader_invalidates_document_state():
+    client = _make_client()
+    session = Session(client)
+    session._frame_id = "MAIN"
+    session._snapshot_id = "old"
+    session._snapshot_refs = {"e1": {"selector": "#go"}}
+    session._isolated_context_id = 5
+    session._last_status_code = 200
+    session._status_source = "navigation_response"
+    client._event_handlers["Page.frameNavigated"][0]({
+        "frame": {"id": "MAIN", "loaderId": "NEW", "url": "http://t/b"},
+    })
+    assert session._snapshot_refs == {}
+    assert session._isolated_context_id is None
+    assert session._last_status_code == 0
+    assert session.document_generation == 1
+
+
 def _navigating_client(doc_events, *, final_url="http://t/", html=""):
     """Client that fires Network.responseReceived events during navigate.
 

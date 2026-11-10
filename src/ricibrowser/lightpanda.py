@@ -220,6 +220,22 @@ class LightpandaEngine:
             cloudflare_type=cf_type,
             screenshot_path=None,
             engine="lightpanda",
+            status_source="unavailable",
+            stealth=None,
+            capabilities={
+                "engine": "lightpanda",
+                "rendering": False,
+                "screenshots": False,
+                "http_status": False,
+                "reliable_final_url": False,
+                "trusted_input": False,
+                "accessibility_tree": False,
+                "isolated_evaluation": True,
+                "storage_persistence": False,
+                "network_metadata": False,
+                "network_bodies": False,
+                "proxy_mode": "none",
+            },
         )
 
     def _ensure_client(self) -> CDPClient:

@@ -1,6 +1,8 @@
 # BROWSER_ENGINE.md — Ricibrowser Design Specification
 
-> **Status:** Design doc (awaiting approval before implementation)
+> **Status:** Historical design/background document. For implemented behavior,
+> use `README.md`, `ARCHITECTURE.md`, and the public API. Statements below that
+> describe future integration are not implementation guarantees.
 > **Project:** `ricibrowser` — a two-engine browser automation module for Riciplay
 > **Location:** `/root/projects/ricibrowser/`
 > **License:** MIT (clean-room implementation, no AGPL-derived code)
@@ -120,7 +122,7 @@ await session.navigate("https://target.com/login")
 await session.fill("#username", "admin")
 await session.fill("#password", "pass")
 await session.click("#login-btn")
-# Cookies/localStorage now persisted in the jar for subsequent calls
+# Cookies/localStorage are persisted when the Session closes
 await session.navigate("https://target.com/dashboard")  # authenticated!
 
 # JS evaluation in ISOLATED world (never main world)
@@ -129,10 +131,12 @@ result = await session.evaluate("document.querySelectorAll('script').length")
 # Screenshot
 await session.screenshot("/tmp/dashboard.png")
 
-# Network capture (debug mode)
-async with engine.debug_network() as net:
-    await session.navigate("https://api.target.com/users")
-    flows = net.flows  # list of {request, response, timing}
+# Network metadata capture (debug mode; no response bodies)
+debug_engine = Engine(EngineConfig(debug_network=True))
+debug_session = await debug_engine.create_session()
+await debug_session.navigate("https://api.target.com/users")
+await debug_session.close()
+flows = debug_engine.network.to_dict()
 
 await session.close()
 ```
@@ -300,10 +304,11 @@ class CookieJar:
 class NetworkCapture:
     """Opt-in request/response capture for security debugging.
 
-    OFF by default (detection vector if left on). When enabled:
+    Archival is OFF by default. When enabled:
       - Listens to CDP Network.requestWillBeSent / Network.responseReceived
-      - Captures {url, method, headers, body, status, timing}
-      - Integrates with miniproxy for full HTTPS interception
+      - Captures bounded request/response metadata: URL, method, headers,
+        status, resource type, timing and request post-data when CDP supplies it
+      - Does not call Network.getResponseBody; response_body capability is false
     """
 
     def __init__(self, enabled: bool = False):
@@ -322,11 +327,10 @@ class NetworkCapture:
         await cdp.send("Network.disable")
 ```
 
-**Why off by default:** `Network.enable` is a known detection vector (sites can
-detect the CDP listener). It's only turned on when the operator explicitly
-requests debug network capture. This is the opposite of stealth-scraping tools
-that leave everything on — we're a security tool that WANTS visibility, but
-only when we ask for it.
+**Why archival is off by default:** extra network event collection has cost and
+visibility implications. Navigation itself may still enable the CDP Network
+domain to observe the main-document status and manage cookies. Completed debug
+metadata is retained in a bounded Engine archive after capture stops.
 
 ### 6.7 Auto-Waiting
 
@@ -346,26 +350,23 @@ async def wait_for_content_stable(cdp: CDPClient, timeout: float = 10.0):
 
 ## 7. miniproxy Integration
 
-miniproxy (now at `/root/projects/miniproxy/`) is a mitmproxy-based HTTP/HTTPS
-interception proxy. Integration with ricibrowser:
+miniproxy is a separately operated mitmproxy-based HTTP/HTTPS interception
+proxy. Current ricibrowser integration is deliberately **route-only**:
 
 1. **Browser-through-proxy:** Chrome launched with `--proxy-server=http://127.0.0.1:8080`
    so all HTTP/HTTPS traffic flows through mitmproxy → captured in SQLite.
 
-2. **CDP + miniproxy combined:** When both the CDP client and miniproxy are
+2. **CDP + miniproxy combined operation:** When both are
    active, the browser's traffic is intercepted at the HTTP layer (miniproxy)
    while DOM/JS is controlled at the CDP layer (ricibrowser). This gives both
    HTTP-level visibility (for replay/fuzzing) and DOM-level control (for
    JS-heavy auth flows).
 
-3. **Cookie sharing:** miniproxy captures `Set-Cookie` headers; ricibrowser's
-   `CookieJar` reads these from miniproxy's SQLite DB and loads them into the
-   CDP session, so a login flow captured by miniproxy is automatically
-   available for subsequent browser navigation.
-
-4. **Discrepancy fix:** The miniproxy `db.py` is missing `get_config` /
-   `set_config` methods (used by `intercept_addon.py`). This will be fixed as
-   part of the integration so intercept mode works correctly.
+3. **No implicit bridge:** ricibrowser does not read miniproxy SQLite, import
+   cookies from it, check its health, or correlate its flow IDs. Browser auth
+   persistence uses ricibrowser's JSON CookieJar only. Capabilities expose
+   `proxy_mode="route_only"` so callers cannot confuse routing with evidence
+   capture.
 
 ---
 

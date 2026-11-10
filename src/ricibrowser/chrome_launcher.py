@@ -16,6 +16,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import time
 from typing import Any
 
 from ricibrowser.stealth import get_stealth_args
@@ -43,6 +44,94 @@ _MACOS_PATHS = [
     "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
     "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
 ]
+
+
+def _process_group_alive(pgid: int) -> bool:
+    """Whether a POSIX process group still has a non-zombie member.
+
+    ``killpg(pgid, 0)`` reports zombie-only groups as existing. Zombies cannot
+    access a Chrome profile and may remain visible until an unrelated PID 1
+    reaps them, so Linux uses procfs to distinguish them. Other POSIX systems
+    conservatively fall back to ``killpg``.
+    """
+    proc_root = "/proc"
+    if os.path.isdir(proc_root):
+        try:
+            entries = os.listdir(proc_root)
+        except OSError:
+            entries = []
+        inspected = False
+        for name in entries:
+            if not name.isdigit():
+                continue
+            try:
+                with open(os.path.join(proc_root, name, "stat"), encoding="utf-8") as file:
+                    stat = file.read()
+                # comm is parenthesized and may contain spaces/parentheses; the
+                # fields after its final ')' start with state, ppid, pgrp.
+                tail = stat[stat.rfind(")") + 2:].split()
+                state, member_pgid = tail[0], int(tail[2])
+                inspected = True
+            except (OSError, ValueError, IndexError):
+                continue
+            if member_pgid == pgid and state != "Z":
+                return True
+        if inspected:
+            return False
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _linux_process_start_ticks(pid: int) -> int | None:
+    """Read Linux's boot-relative process creation tick for PID-reuse checks."""
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as file:
+            stat = file.read()
+        tail = stat[stat.rfind(")") + 2:].split()
+        return int(tail[19])  # field 22 overall; tail starts at field 3
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _capture_group_identity(proc: subprocess.Popen, pgid: int) -> dict[str, Any]:
+    """Capture the private group anchor while its original leader is alive."""
+    identity: dict[str, Any] = {
+        "pgid": int(pgid),
+        "leader_pid": int(proc.pid),
+        "leader_start_ticks": _linux_process_start_ticks(proc.pid),
+    }
+    try:
+        with open("/proc/sys/kernel/random/boot_id", encoding="utf-8") as file:
+            identity["boot_id"] = file.read().strip()
+    except OSError:
+        identity["boot_id"] = None
+    return identity
+
+
+def _validate_group_identity(identity: dict[str, Any]) -> None:
+    """Refuse to signal an anchor whose leader PID has been visibly reused."""
+    expected_boot = identity.get("boot_id")
+    if expected_boot:
+        try:
+            with open("/proc/sys/kernel/random/boot_id", encoding="utf-8") as file:
+                if file.read().strip() != expected_boot:
+                    raise RuntimeError("Chrome process-group identity belongs to another boot")
+        except OSError as exc:
+            raise RuntimeError("Cannot verify Chrome process-group boot identity") from exc
+
+    expected_start = identity.get("leader_start_ticks")
+    if expected_start is None:
+        return
+    current_start = _linux_process_start_ticks(int(identity["leader_pid"]))
+    if current_start is not None and current_start != expected_start:
+        raise RuntimeError(
+            "Chrome process-group leader PID was reused; refusing to signal an unrelated group"
+        )
 
 
 def find_chrome() -> str | None:
@@ -175,6 +264,18 @@ def launch_chrome(
     else:
         kwargs["start_new_session"] = True  # setsid — survives parent exit
     proc = subprocess.Popen(args, **kwargs)
+    # A private process-group anchor must be captured at creation time. Looking
+    # up getpgid(proc.pid) after the leader exits either fails (while children
+    # remain) or, after PID reuse, can identify an unrelated process group.
+    if os.name != "nt":
+        try:
+            pgid = os.getpgid(proc.pid)
+        except OSError:
+            pgid = proc.pid
+        proc._ricibrowser_pgid = pgid  # type: ignore[attr-defined]
+        proc._ricibrowser_group_identity = _capture_group_identity(  # type: ignore[attr-defined]
+            proc, pgid,
+        )
     logger.info("Chrome launched (PID %d)", proc.pid)
     return proc
 
@@ -184,12 +285,14 @@ def stop_chrome(proc: subprocess.Popen) -> None:
 
     Handles both POSIX (process group kill) and Windows (taskkill).
     """
-    if proc.poll() is not None:
-        return  # Already exited
     if os.name == "nt":
+        if proc.poll() is not None:
+            raise RuntimeError(
+                "Chrome leader exited before its Windows process tree could be verified stopped"
+            )
         # Windows: no process groups — use taskkill to kill the tree
         try:
-            subprocess.run(
+            completed = subprocess.run(
                 ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 timeout=10,
@@ -199,34 +302,82 @@ def stop_chrome(proc: subprocess.Popen) -> None:
                 proc.kill()
             except ProcessLookupError:
                 pass
+        else:
+            if completed.returncode != 0:
+                raise RuntimeError(
+                    f"taskkill could not verify Chrome process tree {proc.pid} stopped "
+                    f"(exit {completed.returncode})"
+                )
+        try:
+            proc.wait(timeout=5)
+        except (subprocess.TimeoutExpired, ChildProcessError):
+            pass
+        if proc.poll() is None:
+            raise RuntimeError(f"Chrome process tree {proc.pid} did not stop")
     else:
-        # POSIX: kill the process group.
+        # POSIX: kill the private process group.  Do this even when the leader
+        # already exited: Chrome children can outlive it and continue using the
+        # profile.  Never derive an ownership anchor from a potentially-reused
+        # PID during shutdown.
+        identity = getattr(proc, "_ricibrowser_group_identity", None)
+        pgid = (identity or {}).get("pgid") or getattr(proc, "_ricibrowser_pgid", None)
+        if pgid is None:
+            # Backwards compatibility for externally supplied/fake Popen
+            # handles. A live leader can still prove its current group.
+            if proc.poll() is not None:
+                raise RuntimeError(
+                    "Chrome leader exited but no owned process-group anchor is available"
+                )
+            pgid = os.getpgid(proc.pid)
+        elif identity:
+            _validate_group_identity(identity)
+
+        def _group_alive() -> bool:
+            # poll() reaps the direct child when it has exited, preventing its
+            # zombie record from keeping an otherwise-empty group "alive".
+            proc.poll()
+            return _process_group_alive(int(pgid))
+
+        def _wait_group_gone(timeout: float) -> bool:
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                if not _group_alive():
+                    return True
+                time.sleep(0.05)
+            return not _group_alive()
+
         # NOTE: this is a *synchronous* helper — callers on the event loop
         # must run it in an executor (Engine._ensure_chrome/close do).
-        # The waits are bounded so a Chrome that ignores SIGTERM cannot
-        # hold the caller for longer than the escalation window.
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-            proc.wait(timeout=5)
-        except ProcessLookupError:
-            # Already gone, but still reap so it does not linger as a zombie.
+        # Group checks are bounded so a Chrome that ignores SIGTERM cannot hold
+        # the caller indefinitely.
+        if not _group_alive():
             try:
                 proc.wait(timeout=1)
             except (subprocess.TimeoutExpired, ChildProcessError):
                 pass
-        except subprocess.TimeoutExpired:
+            return
+        try:
+            os.killpg(int(pgid), signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        if _wait_group_gone(5.0):
             try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except ProcessLookupError:
+                proc.wait(timeout=1)
+            except (subprocess.TimeoutExpired, ChildProcessError):
                 pass
-            else:
-                # Reap the SIGKILLed child. Without this every Chrome that
-                # ignored SIGTERM leaked one zombie per Engine.close(), so
-                # the process table grew for the life of a long session.
-                try:
-                    proc.wait(timeout=5)
-                except (subprocess.TimeoutExpired, ChildProcessError):
-                    pass
+            return
+
+        try:
+            os.killpg(int(pgid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        if _wait_group_gone(5.0):
+            try:
+                proc.wait(timeout=1)
+            except (subprocess.TimeoutExpired, ChildProcessError):
+                pass
+            return
+        raise RuntimeError(f"Chrome process group {pgid} did not stop after SIGKILL")
 
 
 def get_debug_url(port: int) -> str:

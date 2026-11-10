@@ -305,6 +305,20 @@ class TestCaptchaHandler:
         assert result.solved is True
         assert result.captcha_type == CaptchaType.NONE
 
+    @pytest.mark.asyncio
+    async def test_generic_always_returns_unsolved_result(self):
+        handler = CaptchaHandler()
+        session = MagicMock()
+        session.evaluate = AsyncMock(return_value="verify you are human")
+        session.evaluate_bool = AsyncMock(return_value=False)
+        result = await handler.detect_and_solve(session)
+        assert result is not None
+        assert result.captcha_type == CaptchaType.GENERIC
+        assert result.solved is False
+
+    def test_explicit_none_disables_cloudflare_auto_solver(self):
+        assert CaptchaHandler(auto_solver=None).auto_solver is None
+
 
 # ── Headers ──────────────────────────────────────────────────────────
 

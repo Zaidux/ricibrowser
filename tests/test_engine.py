@@ -1,6 +1,10 @@
 """Tests for the Engine facade and config."""
 
 import os
+import asyncio
+import json
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -84,6 +88,18 @@ class TestPage:
         assert d["anti_bot_detected"] is True
         assert d["anti_bot_type"] == "cloudflare"
 
+    def test_unknown_status_is_partial_and_capabilities_serialize(self):
+        page = Page(
+            url="https://example.test", final_url="https://example.test",
+            status_code=0, title="", text="", html="",
+            capabilities={"network_bodies": False}, stealth=False,
+        )
+        result = page.to_dict()
+        assert result["status"] == "partial"
+        assert result["status_source"] == "unavailable"
+        assert result["stealth"] is False
+        json.dumps(result)
+
 
 class TestEngineInit:
     def test_engine_creates_without_error(self):
@@ -163,6 +179,103 @@ class TestChromeIsolation:
             assert engine._temp_user_data_dir is None
         finally:
             await engine.close()
+
+    @pytest.mark.asyncio
+    async def test_concurrent_startup_is_singleflight(self, monkeypatch, tmp_path):
+        engine = Engine(EngineConfig(cookie_jar_path=str(tmp_path / "jar.json")))
+        launches = []
+
+        class Proc:
+            returncode = None
+            def poll(self): return None
+
+        def launch(**kwargs):
+            launches.append(kwargs)
+            return Proc()
+
+        class Response:
+            status_code = 200
+
+        class Http:
+            def __init__(self, *args, **kwargs): pass
+            async def __aenter__(self): return self
+            async def __aexit__(self, *args): pass
+            async def get(self, _url):
+                await asyncio.sleep(0.01)
+                return Response()
+
+        monkeypatch.setattr("ricibrowser.engine.launch_chrome", launch)
+        monkeypatch.setattr("ricibrowser.engine._make_profile_dir", lambda: str(tmp_path / "profile"))
+        monkeypatch.setattr("ricibrowser.engine.find_free_port", lambda: 43123)
+        monkeypatch.setattr("httpx.AsyncClient", Http)
+        monkeypatch.setattr("ricibrowser.engine.stop_chrome", lambda _proc: None)
+
+        urls = await asyncio.gather(*(engine._ensure_chrome() for _ in range(12)))
+        assert urls == ["http://127.0.0.1:43123"] * 12
+        assert len(launches) == 1
+        await engine.close()
+
+    @pytest.mark.asyncio
+    async def test_create_sessions_request_distinct_owned_targets(self, monkeypatch, tmp_path):
+        engine = Engine(EngineConfig(cookie_jar_path=str(tmp_path / "jar.json")))
+        monkeypatch.setattr(engine, "_ensure_chrome", AsyncMock(return_value="http://127.0.0.1:1"))
+        created = []
+
+        class Client:
+            def __init__(self, target):
+                self._target_id = target
+                self._event_handlers = {}
+                self.closed = False
+            async def send(self, method, params=None):
+                if method == "Network.getCookies": return {"cookies": []}
+                if method == "Runtime.evaluate":
+                    return {"result": {"value": {"origin": "", "storage": {}}}}
+                return {}
+            async def close(self): self.closed = True
+
+        async def connect(*args, **kwargs):
+            assert kwargs["create_new"] is True
+            target = f"target-{len(created) + 1}"
+            created.append(target)
+            return Client(target)
+
+        monkeypatch.setattr("ricibrowser.engine.CDPClient.connect_to_target", connect)
+        monkeypatch.setattr("ricibrowser.engine.CDPClient.close_target", AsyncMock(return_value=True))
+
+        a, b = await asyncio.gather(engine.create_session(), engine.create_session())
+        assert a._target_id != b._target_id
+        assert len(engine._active_sessions) == 2
+        await a.close()
+        await b.close()
+        assert not engine._active_sessions
+
+    @pytest.mark.asyncio
+    async def test_close_waits_for_inflight_session_admission(self, monkeypatch, tmp_path):
+        engine = Engine(EngineConfig(cookie_jar_path=str(tmp_path / "jar.json")))
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        class FakeSession:
+            def __init__(self):
+                self.close = AsyncMock()
+
+        session = FakeSession()
+
+        async def create():
+            entered.set()
+            await release.wait()
+            engine._active_sessions.add(session)
+            return session
+
+        monkeypatch.setattr(engine, "_create_chrome_session", create)
+        create_task = asyncio.create_task(engine.create_session())
+        await entered.wait()
+        close_task = asyncio.create_task(engine.close())
+        await asyncio.sleep(0)
+        assert not close_task.done()
+        release.set()
+        assert await create_task is session
+        await close_task
+        session.close.assert_awaited_once()
 
 
 if __name__ == "__main__":

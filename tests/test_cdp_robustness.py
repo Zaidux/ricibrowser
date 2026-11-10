@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
 import sys
 import time
@@ -349,3 +350,82 @@ async def test_network_stop_of_unknown_client_is_noop():
     cap = NetworkCapture(enabled=True)
     await cap.stop(_Client())          # never started
     assert cap.flows == []
+
+
+@pytest.mark.asyncio
+async def test_network_stop_retains_completed_capture():
+    from ricibrowser.network import Flow, NetworkCapture
+
+    class _Client:
+        _event_handlers = {}
+        async def send(self, *args, **kwargs): return {}
+
+    client = _Client()
+    cap = NetworkCapture(enabled=True)
+    cap._by_client[id(client)] = {"flows": [Flow("1", url="http://fixture/")], "pending": {}}
+    await cap.stop(client)
+    assert [item["url"] for item in cap.to_dict()] == ["http://fixture/"]
+
+
+@pytest.mark.asyncio
+async def test_engine_close_retains_ownership_when_stop_fails(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from ricibrowser import Engine, EngineConfig
+
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    engine = Engine(EngineConfig(cookie_jar_path=str(tmp_path / "jar.json")))
+    process = SimpleNamespace(pid=123456789)
+    engine._chrome_proc = process
+    engine._temp_user_data_dir = str(profile)
+    monkeypatch.setattr(
+        "ricibrowser.engine.stop_chrome",
+        lambda _proc: (_ for _ in ()).throw(RuntimeError("stop failed")),
+    )
+    with pytest.raises(RuntimeError, match="cleanup incomplete"):
+        await engine.close()
+    assert engine._chrome_proc is process
+    assert engine._temp_user_data_dir == str(profile)
+    assert profile.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group regression")
+def test_stop_chrome_retires_descendant_after_leader_exits():
+    """An exited Chrome leader must not hide a surviving owned child."""
+    import ricibrowser.chrome_launcher as launcher
+
+    proc = subprocess.Popen(
+        ["python3", "-c",
+         "import os,subprocess,sys,time\n"
+         "subprocess.Popen(['python3','-c','import time; time.sleep(60)'],"
+         "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)\n"
+         "sys.stdout.write(str(os.getpid())+'\\n'); sys.stdout.flush()\n"],
+        start_new_session=True,
+        stdout=subprocess.PIPE,
+    )
+    pgid = os.getpgid(proc.pid)
+    proc._ricibrowser_pgid = pgid
+    proc._ricibrowser_group_identity = launcher._capture_group_identity(proc, pgid)
+    assert proc.stdout is not None and proc.stdout.readline()
+    proc.wait(timeout=5)
+    assert launcher._process_group_alive(pgid)
+    launcher.stop_chrome(proc)
+    assert not launcher._process_group_alive(pgid)
+
+
+@pytest.mark.asyncio
+async def test_engine_close_retains_profile_when_removal_fails(monkeypatch, tmp_path):
+    from ricibrowser import Engine, EngineConfig
+
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    engine = Engine(EngineConfig(cookie_jar_path=str(tmp_path / "jar.json")))
+    engine._temp_user_data_dir = str(profile)
+    monkeypatch.setattr(
+        "ricibrowser.engine._remove_profile_dir",
+        lambda _path: (_ for _ in ()).throw(PermissionError("busy profile")),
+    )
+    with pytest.raises(RuntimeError, match="cleanup incomplete"):
+        await engine.close()
+    assert engine._temp_user_data_dir == str(profile)
+    assert profile.exists()

@@ -43,6 +43,9 @@ from ricibrowser.cdp_client import CDPClient, CDPError
 logger = logging.getLogger(__name__)
 
 
+_DEFAULT_AUTO_SOLVER = object()
+
+
 class CaptchaType(Enum):
     """Detected CAPTCHA / anti-bot challenge type."""
 
@@ -677,13 +680,22 @@ class CaptchaHandler:
 
     def __init__(
         self,
-        auto_solver: CloudflareAutoSolver | None = None,
+        auto_solver: CloudflareAutoSolver | None | object = _DEFAULT_AUTO_SOLVER,
         external_solver: CaptchaSolver | None = None,
         slider_solver: SliderCaptchaSolver | None = None,
+        verification_poll_interval: float = 0.25,
+        verification_timeout: float = 5.0,
     ):
-        self.auto_solver = auto_solver or CloudflareAutoSolver()
+        # Omitted means the historical default (enabled); explicit None means
+        # disabled.  ``or CloudflareAutoSolver()`` made the config's False
+        # branch impossible.
+        self.auto_solver = (
+            CloudflareAutoSolver() if auto_solver is _DEFAULT_AUTO_SOLVER else auto_solver
+        )
         self.external_solver = external_solver
         self.slider_solver = slider_solver or SliderCaptchaSolver()
+        self.verification_poll_interval = max(0.01, float(verification_poll_interval))
+        self.verification_timeout = max(0.01, float(verification_timeout))
 
     async def detect_and_solve(self, session) -> CaptchaResult:
         """Detect the CAPTCHA type and attempt resolution.
@@ -707,8 +719,14 @@ class CaptchaHandler:
 
         # ── Cloudflare JS challenge → auto-solve ───────────────────
         if captcha_type == CaptchaType.CLOUDFLARE_JS:
-            result = await self.auto_solver.solve(session)
-            return result
+            if self.auto_solver is not None:
+                return await self.auto_solver.solve(session)
+            return CaptchaResult(
+                captcha_type=captcha_type,
+                solved=False,
+                error="Cloudflare auto-resolution is disabled and no solver handled this challenge.",
+                duration_seconds=time.monotonic() - start,
+            )
 
         # ── Slider puzzle → in-engine gap analysis + trusted drag ──
         if captcha_type == CaptchaType.SLIDER:
@@ -768,6 +786,19 @@ class CaptchaHandler:
                     duration_seconds=time.monotonic() - start,
                 )
 
+        # Every detection branch has a concrete result.  Generic challenges,
+        # unsupported challenge types, and external solvers returning no token
+        # previously fell off this method and returned None.
+        solver_name = "external" if self.external_solver else "none"
+        return CaptchaResult(
+            captcha_type=captcha_type,
+            solved=False,
+            error=f"No solver available for {captcha_type.value} "
+                  f"(registered: {solver_name}). For Cloudflare JS challenges, "
+                  f"ensure real Chrome is used (not Lightpanda).",
+            duration_seconds=time.monotonic() - start,
+        )
+
         # ── external-solver token injection + verification ───────────────
 
     async def _inject_token(
@@ -819,7 +850,7 @@ class CaptchaHandler:
         False on timeout so the caller reports an honest failure instead of
         a success that never happened.
         """
-        deadline = time.monotonic() + 5.0
+        deadline = time.monotonic() + self.verification_timeout
         selectors = {
             CaptchaType.RECAPTCHA_V2: (
                 "#g-recaptcha, .g-recaptcha, iframe[src*='recaptcha']"
@@ -846,20 +877,9 @@ class CaptchaHandler:
                     "})()"
                 )
             except Exception:
-                await asyncio.sleep(self.poll_interval)
+                await asyncio.sleep(self.verification_poll_interval)
                 continue
             if state in ("gone", "accepted"):
                 return True
-            await asyncio.sleep(self.poll_interval)
+            await asyncio.sleep(self.verification_poll_interval)
         return False
-
-    # ── No solver available for this type ──────────────────────
-        solver_name = "external" if self.external_solver else "none"
-        return CaptchaResult(
-            captcha_type=captcha_type,
-            solved=False,
-            error=f"No solver available for {captcha_type.value} "
-                  f"(registered: {solver_name}). For Cloudflare JS challenges, "
-                  f"ensure real Chrome is used (not Lightpanda).",
-            duration_seconds=time.monotonic() - start,
-        )

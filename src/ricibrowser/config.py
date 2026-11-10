@@ -90,6 +90,12 @@ class EngineConfig:
     """Ensure Sec-CH-UA and request headers match a real Chrome release."""
     url_stability_timeout: float = 8.0
     """Max seconds to poll location.href after page load for JS-based SSO redirects."""
+    url_change_timeout: float = 1.25
+    """Seconds to watch for a delayed post-load/click URL change.
+
+    Kept separate from ``url_stability_timeout`` so no-navigation clicks do
+    not pay the full redirect-chain settling window.
+    """
     nav_timeout: float = 30.0
     """Max seconds to wait for the Page.loadEventFired signal after Page.navigate."""
     chrome_startup_timeout: float = 20.0
